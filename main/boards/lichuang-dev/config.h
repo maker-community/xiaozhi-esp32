@@ -58,5 +58,14 @@
 
 #define XCLK_FREQ_HZ 24000000
 
+/* UART for external device control */
+#define UART_ECHO_TXD GPIO_NUM_10
+#define UART_ECHO_RXD GPIO_NUM_11
+#define UART_ECHO_RTS (-1)
+#define UART_ECHO_CTS (-1)
+
+#define ECHO_UART_PORT_NUM      UART_NUM_1
+#define ECHO_UART_BAUD_RATE     (115200)
+#define BUF_SIZE                (1024)
 
 #endif // _BOARD_CONFIG_H_
