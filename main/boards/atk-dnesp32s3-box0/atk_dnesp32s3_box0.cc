@@ -17,6 +17,7 @@
 
 #include <driver/rtc_io.h>
 #include <esp_sleep.h>
+#include "usb_esp32_camera.h"
 
 #define TAG "atk_dnesp32s3_box0"
 
@@ -40,7 +41,7 @@ private:
     esp_timer_handle_t wake_timer_handle_;
     esp_lcd_panel_io_handle_t panel_io = nullptr;
     esp_lcd_panel_handle_t panel = nullptr;
-
+    USB_Esp32Camera* camera_;
     int ticks_ = 0;
     const int kChgCtrlInterval = 5;
 
@@ -335,6 +336,10 @@ private:
                                     });
     }
 
+    void InitializeCamera() {
+        camera_ = new USB_Esp32Camera(); 
+    }
+
 public:
     atk_dnesp32s3_box0() :
         right_button_(R_BUTTON_GPIO, false),
@@ -348,6 +353,7 @@ public:
         InitializeSt7789Display();
         InitializeButtons();
         GetBacklight()->RestoreBrightness();
+        InitializeCamera();
     }
 
     virtual AudioCodec* GetAudioCodec() override {
@@ -393,6 +399,10 @@ public:
             power_save_timer_->WakeUp();
         }
         WifiBoard::SetPowerSaveMode(enabled);
+    }
+
+    virtual Camera* GetCamera() override {
+        return camera_;
     }
 };
 

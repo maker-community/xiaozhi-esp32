@@ -18,6 +18,7 @@
 #include <driver/rtc_io.h>
 #include <esp_sleep.h>
 #include "esp_io_expander_tca95xx_16bit.h"
+#include "usb_esp32_camera.h"
 
 #define TAG "atk_dnesp32s3_box2_4g"
 
@@ -38,6 +39,7 @@ private:
     esp_timer_handle_t wake_timer_handle_;
     esp_lcd_panel_io_handle_t panel_io = nullptr;
     esp_lcd_panel_handle_t panel = nullptr;
+    USB_Esp32Camera* camera_;
     int ticks_ = 0;
     const int kChgCtrlInterval = 5;
 
@@ -175,7 +177,7 @@ private:
         ret |= esp_io_expander_set_level(io_exp_handle, XIO_EN_4G, 1);
         ret |= esp_io_expander_set_level(io_exp_handle, XIO_SPK_EN, 1);
         ret |= esp_io_expander_set_level(io_exp_handle, XIO_USB_SEL, 1);
-        ret |= esp_io_expander_set_level(io_exp_handle, XIO_VBUS_EN, 0);
+        ret |= esp_io_expander_set_level(io_exp_handle, XIO_VBUS_EN, 1);
 
         assert(ret == ESP_OK);
     }
@@ -422,6 +424,10 @@ private:
                                     });
     }
 
+    void InitializeCamera() {
+        camera_ = new USB_Esp32Camera(); 
+    }
+
 public:
     atk_dnesp32s3_box2_4g() :
            DualNetworkBoard(Module_4G_TX_PIN, Module_4G_RX_PIN) {
@@ -433,6 +439,7 @@ public:
         InitializeButtons();
         GetBacklight()->RestoreBrightness();
         InitializeBoardPowerManager();
+        InitializeCamera();
     }
 
     virtual AudioCodec* GetAudioCodec() override {
@@ -478,6 +485,10 @@ public:
             power_save_timer_->WakeUp();
         }
         DualNetworkBoard::SetPowerSaveMode(enabled);
+    }
+
+    virtual Camera* GetCamera() override {
+        return camera_;
     }
 };
 
