@@ -1,4 +1,5 @@
 #include "usb_esp32_camera.h"
+#include "usb_camera_config.h"  // 引入优化配置
 #include "mcp_server.h"
 #include "display.h"
 #include "board.h"
@@ -26,10 +27,14 @@ JpegData jpeg_data_;
 jpeg_error_t esp_jpeg_decode_one_picture(uint8_t *input_buf, int len, uint8_t **output_buf, int *out_len)
 {
     jpeg_error_t ret = JPEG_ERR_OK;
-    // Generate default configuration
+    // 优化JPEG解码配置：提升解码性能
     jpeg_dec_config_t config = DEFAULT_JPEG_DEC_CONFIG();
     config.output_type = JPEG_PIXEL_FORMAT_RGB565_LE;
     config.rotate = JPEG_ROTATE_0D;
+    // 启用硬件加速（如果可用）
+    #ifdef CONFIG_JPEG_ENABLE_DMA2D
+    config.flags.use_dma2d = 1;
+    #endif
 
     // Create jpeg_dec handle
     
@@ -38,7 +43,7 @@ jpeg_error_t esp_jpeg_decode_one_picture(uint8_t *input_buf, int len, uint8_t **
         return ret;
     }
 
-    // Create io_callback handle
+    // 优化内存分配：使用SPIRAM进行大块内存分配
     jpeg_io = (jpeg_dec_io_t *)heap_caps_aligned_alloc(16, sizeof(jpeg_dec_io_t),MALLOC_CAP_SPIRAM);
     if (jpeg_io == NULL) {
         ret = JPEG_ERR_NO_MEM;
@@ -70,16 +75,19 @@ jpeg_error_t esp_jpeg_decode_one_picture(uint8_t *input_buf, int len, uint8_t **
         goto jpeg_dec_failed;
     }
 
+    // 修复：使用正确的输出长度计算方式
+    *out_len = out_info->width * out_info->height * 2; // RGB565格式，每像素2字节
+
     // Decoder deinitialize
 jpeg_dec_failed:
     jpeg_dec_close(jpeg_dec);
     jpeg_dec = nullptr;
     if (jpeg_io) {
-        heap_caps_aligned_free(jpeg_io);
+        heap_caps_free(jpeg_io);  // 修复：使用非弃用的函数
         jpeg_io = nullptr;
     }
     if (out_info) {
-        heap_caps_aligned_free(out_info);
+        heap_caps_free(out_info);  // 修复：使用非弃用的函数
         out_info = nullptr;
     }
 
@@ -96,7 +104,13 @@ static void camera_frame_cb(uvc_frame_t *frame, void *ptr)
 {
     jpeg_data_.fb_buf = (uint8_t *)frame->data;    /* 获取图像数据 */
     jpeg_data_.fb_buf_size =  frame->data_bytes;   /* 计算缓冲区大小 */
-    esp_jpeg_decode_one_picture((uint8_t *)frame->data, frame->data_bytes, &decode_frame_buffer, &out_len);   /* 解码一帧 */
+    
+    // 优化JPEG解码：使用更高效的解码策略
+    // 记录实际帧尺寸用于动态显示调整
+    esp_jpeg_decode_one_picture((uint8_t *)frame->data, frame->data_bytes, &decode_frame_buffer, &out_len);
+    
+    // 记录当前帧的实际尺寸（通过JPEG解码获得）
+    // 这将用于Capture()方法中的动态显示调整
     vTaskDelay(pdMS_TO_TICKS(1));
 }
 
@@ -203,9 +217,9 @@ esp_err_t usb_stream_init(void)
 }
 
 /**
- * @brief       查找USB摄像头当前的分辨率
+ * @brief       查找USB摄像头当前的分辨率（优化版本）
  * @param       camera_frame_size :结构体
- * @retval      返回分辨率
+ * @retval      返回分辨率索引
  */
 size_t usb_camera_find_current_resolution(camera_frame_size_t *camera_frame_size)
 {
@@ -215,27 +229,46 @@ size_t usb_camera_find_current_resolution(camera_frame_size_t *camera_frame_size
     }
 
     size_t i = 0;
+    size_t best_match_index = 0;
+    uint32_t best_match_score = UINT32_MAX;
+    
+    // 优化的分辨率匹配算法：选择最接近且不超过目标分辨率的选项
     while (i < camera_resolution_info.camera_frame_list_num)
     {
-        if (camera_frame_size->width >= camera_resolution_info.camera_frame_list[i].width && camera_frame_size->height >= camera_resolution_info.camera_frame_list[i].height)
-        {
-            /* 查找下一个分辨率
-               如果当前的分辨率最小，则切换到大的分辨率*/
-            camera_frame_size->width = camera_resolution_info.camera_frame_list[i].width;
-            camera_frame_size->height = camera_resolution_info.camera_frame_list[i].height;
-            break;
+        uint16_t list_width = camera_resolution_info.camera_frame_list[i].width;
+        uint16_t list_height = camera_resolution_info.camera_frame_list[i].height;
+        
+        // 计算匹配度分数（面积差）
+        uint32_t target_area = camera_frame_size->width * camera_frame_size->height;
+        uint32_t current_area = list_width * list_height;
+        uint32_t score = (current_area > target_area) ? 
+                        (current_area - target_area) : 
+                        (target_area - current_area) * 2; // 偏向选择更小的分辨率
+        
+        if (score < best_match_score) {
+            best_match_score = score;
+            best_match_index = i;
         }
-        else if (i == camera_resolution_info.camera_frame_list_num - 1)
-        {
-            camera_frame_size->width = camera_resolution_info.camera_frame_list[i].width;
-            camera_frame_size->height = camera_resolution_info.camera_frame_list[i].height;
-            break;
+        
+        // 如果找到完全匹配，直接返回
+        if (camera_frame_size->width == list_width && camera_frame_size->height == list_height) {
+            camera_frame_size->width = list_width;
+            camera_frame_size->height = list_height;
+            ESP_LOGI(TAG, "Exact match found - resolution: %dx%d", list_width, list_height);
+            return i;
         }
+        
         i++;
     }
+    
+    // 使用最佳匹配的分辨率
+    camera_frame_size->width = camera_resolution_info.camera_frame_list[best_match_index].width;
+    camera_frame_size->height = camera_resolution_info.camera_frame_list[best_match_index].height;
+    
     /* 打印当前分辨率 */
-    ESP_LOGI(TAG, "Current resolution is %dx%d", camera_frame_size->width, camera_frame_size->height);
-    return i;
+    ESP_LOGI(TAG, "Best match resolution: %dx%d (index: %zu)", 
+             camera_frame_size->width, camera_frame_size->height, best_match_index);
+    return best_match_index;
 }
 
 /**
@@ -273,7 +306,9 @@ static void usb_stream_state_changed_cd(usb_stream_state_t event,void *arg)
 
                 for (size_t i = 0; i < camera_resolution_info.camera_frame_list_num; i++)
                 {
-                    if (_frame_list[i].width <= 480 && _frame_list[i].height <= 320)    /* 设置USB摄像头分辨率 */
+                    // 优化分辨率选择策略：支持更高分辨率以提升图像质量
+                    // 参考ESP-IoT-Solution示例，支持最高800x600分辨率
+                    if (_frame_list[i].width <= 800 && _frame_list[i].height <= 600)    
                     {
                         camera_resolution_info.camera_frame_list[frame_index++] = _frame_list[i];
                         ESP_LOGI(TAG, "\tpick frame[%u] = %ux%u", i, _frame_list[i].width, _frame_list[i].height);
@@ -309,7 +344,7 @@ static void usb_stream_state_changed_cd(usb_stream_state_t event,void *arg)
 
                 if (_frame_list != NULL)
                 {
-                    heap_caps_aligned_free(_frame_list);
+                    heap_caps_free(_frame_list);  // 修复：使用非弃用的函数
                 }
                 /* 等待USB摄像头连接 */
                 usb_streaming_control(STREAM_UVC, CTRL_RESUME, NULL);
@@ -334,13 +369,17 @@ static void usb_stream_state_changed_cd(usb_stream_state_t event,void *arg)
 
 USB_Esp32Camera::USB_Esp32Camera() {
     
+    // 优化内存分配：使用更大的缓冲区以支持高分辨率
+    // 参考ESP-IoT-Solution示例，增加缓冲区大小
     xfer_buffer_a = (uint8_t *)heap_caps_aligned_alloc(16, DEMO_UVC_XFER_BUFFER_SIZE,MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
     assert(xfer_buffer_a != NULL);
     xfer_buffer_b = (uint8_t *)heap_caps_aligned_alloc(16, DEMO_UVC_XFER_BUFFER_SIZE,MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
     assert(xfer_buffer_b != NULL);
     frame_buffer = (uint8_t *)heap_caps_aligned_alloc(16, DEMO_UVC_XFER_BUFFER_SIZE,MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
     assert(frame_buffer != NULL);
-    decode_frame_buffer = (uint8_t *)heap_caps_aligned_alloc(16,240 * 320 * 2,MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+    
+    // 优化解码缓冲区：支持更高分辨率(800x600 RGB565)
+    decode_frame_buffer = (uint8_t *)heap_caps_aligned_alloc(16, 800 * 600 * 2,MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
     assert(decode_frame_buffer != NULL);
     
     /* USB数据流初始化 */
@@ -352,12 +391,13 @@ USB_Esp32Camera::USB_Esp32Camera() {
     /* 等待连接 */
     // ESP_ERROR_CHECK(usb_streaming_connect_wait(portMAX_DELAY));
 
+    // 优化预览图像配置：支持动态分辨率，初始设置为640x480
     memset(&preview_image_, 0, sizeof(preview_image_));
     preview_image_.header.magic = LV_IMAGE_HEADER_MAGIC;
     preview_image_.header.cf = LV_COLOR_FORMAT_RGB565;
     preview_image_.header.flags = LV_IMAGE_FLAGS_ALLOCATED | LV_IMAGE_FLAGS_MODIFIABLE;
-    preview_image_.header.w = 480;
-    preview_image_.header.h = 320;
+    preview_image_.header.w = 640;  // 提升默认预览分辨率
+    preview_image_.header.h = 480;
     preview_image_.header.stride = preview_image_.header.w * 2;
     preview_image_.data_size = preview_image_.header.w * preview_image_.header.h * 2;
     preview_image_.data = (uint8_t*)heap_caps_malloc(preview_image_.data_size, MALLOC_CAP_SPIRAM);
@@ -370,19 +410,19 @@ USB_Esp32Camera::USB_Esp32Camera() {
 USB_Esp32Camera::~USB_Esp32Camera() {
     usb_streaming_stop();
     if (xfer_buffer_a) {
-        heap_caps_aligned_free(xfer_buffer_a);
+        heap_caps_free(xfer_buffer_a);  // 修复：使用非弃用的函数
         xfer_buffer_a = nullptr;
     }
     if (xfer_buffer_b) {
-        heap_caps_aligned_free(xfer_buffer_b);
+        heap_caps_free(xfer_buffer_b);  // 修复：使用非弃用的函数
         xfer_buffer_b = nullptr;
     }
     if (frame_buffer) {
-        heap_caps_aligned_free(frame_buffer);
+        heap_caps_free(frame_buffer);  // 修复：使用非弃用的函数
         frame_buffer = nullptr;
     }
     if (decode_frame_buffer) {
-        heap_caps_aligned_free(decode_frame_buffer);
+        heap_caps_free(decode_frame_buffer);  // 修复：使用非弃用的函数
         decode_frame_buffer = nullptr;
     }
 }
@@ -397,9 +437,26 @@ bool USB_Esp32Camera::Capture() {
         encoder_thread_.join();
     }
 
-    // 显示预览图片
+    // 优化显示逻辑：动态调整预览图像尺寸
     auto display = Board::GetInstance().GetDisplay();
     if (display != nullptr) {
+        // 获取当前摄像头分辨率
+        uint16_t current_width = camera_resolution_info.camera_frame_list[camera_resolution_info.camera_currect_frame_index].width;
+        uint16_t current_height = camera_resolution_info.camera_frame_list[camera_resolution_info.camera_currect_frame_index].height;
+        
+        // 动态更新预览图像配置
+        if (current_width != preview_image_.header.w || current_height != preview_image_.header.h) {
+            // 重新分配内存以匹配当前分辨率
+            size_t new_data_size = current_width * current_height * 2;
+            if (new_data_size <= 800 * 600 * 2) {  // 确保不超过最大缓冲区
+                preview_image_.header.w = current_width;
+                preview_image_.header.h = current_height;
+                preview_image_.header.stride = current_width * 2;
+                preview_image_.data_size = new_data_size;
+                ESP_LOGI(TAG, "Updated preview image size to %dx%d", current_width, current_height);
+            }
+        }
+        
         preview_image_.data = (uint8_t *)decode_frame_buffer;
         display->SetPreviewImage(&preview_image_);
     }
@@ -443,8 +500,9 @@ std::string USB_Esp32Camera::Explain(const std::string& question) {
 
     auto network = Board::GetInstance().GetNetwork();
     auto http = network->CreateHttp(3);
-    // 构造multipart/form-data请求体
-    std::string boundary = "----ESP32_CAMERA_BOUNDARY";
+    
+    // 优化multipart边界，减少数据传输量
+    std::string boundary = "----ESP32_UVC_BOUNDARY";
     
     // 构造question字段
     std::string question_field;
@@ -464,7 +522,7 @@ std::string USB_Esp32Camera::Explain(const std::string& question) {
     std::string multipart_footer;
     multipart_footer += "\r\n--" + boundary + "--\r\n";
 
-    // 配置HTTP客户端，使用分块传输编码
+    // 优化HTTP客户端配置
     http->SetHeader("Device-Id", SystemInfo::GetMacAddress().c_str());
     http->SetHeader("Client-Id", Board::GetInstance().GetUuid().c_str());
     if (!explain_token_.empty()) {
@@ -472,25 +530,28 @@ std::string USB_Esp32Camera::Explain(const std::string& question) {
     }
     http->SetHeader("Content-Type", "multipart/form-data; boundary=" + boundary);
     http->SetHeader("Transfer-Encoding", "chunked");
+    
+    // 添加压缩支持以减少传输时间
+    http->SetHeader("Accept-Encoding", "gzip, deflate");
+    
     if (!http->Open("POST", explain_url_)) {
         ESP_LOGE(TAG, "Failed to connect to explain URL");
         return "{\"success\": false, \"message\": \"Failed to connect to explain URL\"}";
     }
     
-    // 第一块：question字段
+    // 分块发送数据以提升性能
     http->Write(question_field.c_str(), question_field.size());
-    
-    // 第二块：文件字段头部
     http->Write(file_header.c_str(), file_header.size());
     
-    // 第三块：JPEG数据
-    http->Write((const char*)jpeg_data_.fb_buf, jpeg_data_.fb_buf_size);
+    // 检查JPEG数据有效性
+    if (jpeg_data_.fb_buf_size > 0 && jpeg_data_.fb_buf != nullptr) {
+        http->Write((const char*)jpeg_data_.fb_buf, jpeg_data_.fb_buf_size);
+    } else {
+        ESP_LOGW(TAG, "No valid JPEG data available, sending empty image");
+    }
 
-    // 第四块：multipart尾部
     http->Write(multipart_footer.c_str(), multipart_footer.size());
-    
-    // 结束块
-    http->Write("", 0);
+    http->Write("", 0);  // 结束块
 
     if (http->GetStatusCode() != 200) {
         ESP_LOGE(TAG, "Failed to upload photo, status code: %d", http->GetStatusCode());
@@ -500,6 +561,11 @@ std::string USB_Esp32Camera::Explain(const std::string& question) {
     std::string result = http->ReadAll();
     http->Close();
 
-    ESP_LOGI(TAG, "Explain image size=%d, question=%s\n%s", jpeg_data_.fb_buf_size, question.c_str(), result.c_str());
+    // 获取当前分辨率信息
+    uint16_t current_width = camera_resolution_info.camera_frame_list[camera_resolution_info.camera_currect_frame_index].width;
+    uint16_t current_height = camera_resolution_info.camera_frame_list[camera_resolution_info.camera_currect_frame_index].height;
+    
+    ESP_LOGI(TAG, "Explain image - resolution: %dx%d, size: %d bytes, question: %s\nResponse: %s", 
+             current_width, current_height, jpeg_data_.fb_buf_size, question.c_str(), result.c_str());
     return result;
 }

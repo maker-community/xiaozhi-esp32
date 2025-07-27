@@ -14,7 +14,7 @@
 #include "camera.h"
 
 #define DEMO_KEY_RESOLUTION         "resolution"
-#define DEMO_UVC_XFER_BUFFER_SIZE   ( 88 * 1024) /* 双缓冲 */
+#define DEMO_UVC_XFER_BUFFER_SIZE   ( 200 * 1024) /* 优化：增加缓冲区大小以支持高分辨率 */
 
 typedef struct {
     uint16_t width;
