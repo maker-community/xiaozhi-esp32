@@ -9,11 +9,17 @@
 #include "led/single_led.h"
 #include "assets/lang_config.h"
 #include "power_manager.h"
+#include "mcp_server.h"
+#include "settings.h"
 
 #include "i2c_device.h"
 #include <esp_log.h>
 #include <esp_lcd_panel_vendor.h>
 #include <wifi_station.h>
+#include <driver/uart.h>
+#include <cstring>
+#include <string>
+#include <algorithm>
 
 #include <driver/rtc_io.h>
 #include <esp_sleep.h>
@@ -195,6 +201,297 @@ private:
             },
         };
         ESP_ERROR_CHECK(i2c_new_master_bus(&i2c_bus_cfg, &i2c_bus_));
+    }
+
+    /*
+        初始化UART用于外部设备控制
+        使用GPIO45作为TXD，GPIO46作为RXD
+        参考sparkbot的高效串口配置
+    */
+    void InitializeEchoUart() {
+        uart_config_t uart_config = {
+            .baud_rate = ECHO_UART_BAUD_RATE,
+            .data_bits = UART_DATA_8_BITS,
+            .parity    = UART_PARITY_DISABLE,
+            .stop_bits = UART_STOP_BITS_1,
+            .flow_ctrl = UART_HW_FLOWCTRL_DISABLE,
+            .source_clk = UART_SCLK_DEFAULT,
+        };
+        int intr_alloc_flags = 0;
+
+        ESP_ERROR_CHECK(uart_driver_install(ECHO_UART_PORT_NUM, BUF_SIZE * 2, 0, 0, NULL, intr_alloc_flags));
+        ESP_ERROR_CHECK(uart_param_config(ECHO_UART_PORT_NUM, &uart_config));
+        ESP_ERROR_CHECK(uart_set_pin(ECHO_UART_PORT_NUM, UART_ECHO_TXD, UART_ECHO_RXD, UART_ECHO_RTS, UART_ECHO_CTS));
+
+        // 简化初始化，发送基础初始化命令
+        SendUartMessage("INIT");
+        
+        ESP_LOGI(TAG, "UART初始化完成，TXD:%d, RXD:%d", UART_ECHO_TXD, UART_ECHO_RXD);
+    }
+
+    // 优化的串口命令发送方法，参考sparkbot只发送不接收的高效实现
+    std::string SendUartCommand(const char* command_str, int timeout_ms = 1000) {
+        if (!command_str) {
+            return "ERROR: 命令为空";
+        }
+
+        // 发送命令，减少字符串拷贝
+        uint8_t len = strlen(command_str);
+        uart_write_bytes(ECHO_UART_PORT_NUM, command_str, len);
+
+        // 可选：添加换行符，根据设备需求决定
+        if (len > 0 && command_str[len-1] != '\n') {
+            uart_write_bytes(ECHO_UART_PORT_NUM, "\r\n", 2);
+        }
+
+        // 等待发送完成
+        uart_wait_tx_done(ECHO_UART_PORT_NUM, pdMS_TO_TICKS(100));
+
+        // 参考sparkbot，只发送不接收，直接返回成功状态
+        return "OK: 命令已发送";
+    }
+
+    // 简化的串口消息发送，参考sparkbot实现
+    void SendUartMessage(const char * command_str) {
+        if (!command_str) return;
+        
+        uint8_t len = strlen(command_str);
+        uart_write_bytes(ECHO_UART_PORT_NUM, command_str, len);
+        ESP_LOGI(TAG, "Sent command: %s", command_str);
+    }
+
+    void InitializeTools() {
+        auto& mcp_server = McpServer::GetInstance();
+        
+        ESP_LOGI(TAG, "开始注册Lichuang Dev MCP工具...");
+
+        // 基础控制指令 - 参考sparkbot只发送不等待响应
+        mcp_server.AddTool("self.device.send_command", "发送自定义命令到外部设备", 
+            PropertyList({Property("command", kPropertyTypeString, "")}),
+            [this](const PropertyList& properties) -> ReturnValue {
+                std::string command = properties["command"].value<std::string>();
+                if (command.empty()) {
+                    return "错误：命令不能为空";
+                }
+                
+                std::string response = SendUartCommand(command.c_str());  // 移除超时参数
+                return "命令: " + command + " | 状态: " + response;
+            });
+
+        // Otto机器人标准命令实现
+        
+        // 初始化命令
+        mcp_server.AddTool("self.device.init", "初始化机器人", PropertyList(),
+            [this](const PropertyList& properties) -> ReturnValue {
+                std::string response = SendUartCommand("INIT");  // 移除超时参数
+                return "初始化完成 | 状态: " + response;
+            });
+
+        // 回到初始位置
+        mcp_server.AddTool("self.device.home", "回到初始位置", 
+            PropertyList({Property("hands_down", kPropertyTypeInteger, 1, 0, 1)}),
+            [this](const PropertyList& properties) -> ReturnValue {
+                int hands_down = properties["hands_down"].value<int>();
+                std::string command = "HOME " + std::to_string(hands_down);
+                std::string response = SendUartCommand(command.c_str());  // 移除超时参数
+                return "回到初始位置 | 状态: " + response;
+            });
+
+        // 运动控制 - 参考sparkbot只发送不等待响应
+        mcp_server.AddTool("self.device.walk", "机器人行走", 
+            PropertyList({
+                Property("steps", kPropertyTypeInteger, 2, 1, 10),
+                Property("speed", kPropertyTypeInteger, 1000, 500, 3000),
+                Property("direction", kPropertyTypeInteger, 1, -1, 1),  // 1=前进, -1=后退
+                Property("amount", kPropertyTypeInteger, 30, 0, 50)     // 手臂摆动幅度
+            }),
+            [this](const PropertyList& properties) -> ReturnValue {
+                int steps = properties["steps"].value<int>();
+                int speed = properties["speed"].value<int>();
+                int direction = properties["direction"].value<int>();
+                int amount = properties["amount"].value<int>();
+                
+                std::string command = "WALK " + std::to_string(steps) + " " + 
+                                    std::to_string(speed) + " " + 
+                                    std::to_string(direction) + " " + 
+                                    std::to_string(amount);
+                
+                std::string response = SendUartCommand(command.c_str());  // 移除超时参数
+                std::string direction_str = (direction == 1) ? "前进" : "后退";
+                return direction_str + std::to_string(steps) + "步 | 状态: " + response;
+            });
+
+        mcp_server.AddTool("self.device.move_forward", "设备前进", 
+            PropertyList({
+                Property("steps", kPropertyTypeInteger, 3, 1, 10),
+                Property("speed", kPropertyTypeInteger, 1200, 500, 3000)
+            }),
+            [this](const PropertyList& properties) -> ReturnValue {
+                int steps = properties["steps"].value<int>();
+                int speed = properties["speed"].value<int>();
+                std::string command = "WALK " + std::to_string(steps) + " " + 
+                                    std::to_string(speed) + " 1 30";
+                std::string response = SendUartCommand(command.c_str());  // 移除超时参数
+                return "前进" + std::to_string(steps) + "步 | 状态: " + response;
+            });
+
+        mcp_server.AddTool("self.device.move_backward", "设备后退", 
+            PropertyList({
+                Property("steps", kPropertyTypeInteger, 3, 1, 10),
+                Property("speed", kPropertyTypeInteger, 1200, 500, 3000)
+            }),
+            [this](const PropertyList& properties) -> ReturnValue {
+                int steps = properties["steps"].value<int>();
+                int speed = properties["speed"].value<int>();
+                std::string command = "WALK " + std::to_string(steps) + " " + 
+                                    std::to_string(speed) + " -1 30";
+                std::string response = SendUartCommand(command.c_str());  // 移除超时参数
+                return "后退" + std::to_string(steps) + "步 | 状态: " + response;
+            });
+
+        // 转向控制
+        mcp_server.AddTool("self.device.turn", "机器人转向", 
+            PropertyList({
+                Property("steps", kPropertyTypeInteger, 1, 1, 5),
+                Property("speed", kPropertyTypeInteger, 2000, 1000, 3000),
+                Property("direction", kPropertyTypeInteger, 1, -1, 1),  // 1=左转, -1=右转
+                Property("amount", kPropertyTypeInteger, 0, 0, 50)
+            }),
+            [this](const PropertyList& properties) -> ReturnValue {
+                int steps = properties["steps"].value<int>();
+                int speed = properties["speed"].value<int>();
+                int direction = properties["direction"].value<int>();
+                int amount = properties["amount"].value<int>();
+                
+                std::string command = "TURN " + std::to_string(steps) + " " + 
+                                    std::to_string(speed) + " " + 
+                                    std::to_string(direction) + " " + 
+                                    std::to_string(amount);
+                
+                std::string response = SendUartCommand(command.c_str());  // 移除超时参数
+                std::string direction_str = (direction == 1) ? "左转" : "右转";
+                return direction_str + std::to_string(steps) + "步 | 状态: " + response;
+            });
+
+        mcp_server.AddTool("self.device.turn_left", "设备左转", 
+            PropertyList({
+                Property("steps", kPropertyTypeInteger, 2, 1, 5),
+                Property("speed", kPropertyTypeInteger, 2000, 1000, 3000)
+            }),
+            [this](const PropertyList& properties) -> ReturnValue {
+                int steps = properties["steps"].value<int>();
+                int speed = properties["speed"].value<int>();
+                std::string command = "TURN " + std::to_string(steps) + " " + 
+                                    std::to_string(speed) + " 1 0";
+                std::string response = SendUartCommand(command.c_str());  // 移除超时参数
+                return "左转" + std::to_string(steps) + "步 | 状态: " + response;
+            });
+
+        mcp_server.AddTool("self.device.turn_right", "设备右转", 
+            PropertyList({
+                Property("steps", kPropertyTypeInteger, 2, 1, 5),
+                Property("speed", kPropertyTypeInteger, 2000, 1000, 3000)
+            }),
+            [this](const PropertyList& properties) -> ReturnValue {
+                int steps = properties["steps"].value<int>();
+                int speed = properties["speed"].value<int>();
+                std::string command = "TURN " + std::to_string(steps) + " " + 
+                                    std::to_string(speed) + " -1 0";
+                std::string response = SendUartCommand(command.c_str());  // 移除超时参数
+                return "右转" + std::to_string(steps) + "步 | 状态: " + response;
+            });
+
+        // 其他动作
+        mcp_server.AddTool("self.device.jump", "机器人跳跃", 
+            PropertyList({
+                Property("steps", kPropertyTypeInteger, 1, 1, 3),
+                Property("speed", kPropertyTypeInteger, 2000, 1000, 3000)
+            }),
+            [this](const PropertyList& properties) -> ReturnValue {
+                int steps = properties["steps"].value<int>();
+                int speed = properties["speed"].value<int>();
+                std::string command = "JUMP " + std::to_string(steps) + " " + std::to_string(speed);
+                std::string response = SendUartCommand(command.c_str());  // 移除超时参数
+                return "跳跃" + std::to_string(steps) + "次 | 状态: " + response;
+            });
+
+        mcp_server.AddTool("self.device.swing", "机器人摇摆", 
+            PropertyList({
+                Property("steps", kPropertyTypeInteger, 1, 1, 5),
+                Property("speed", kPropertyTypeInteger, 1000, 500, 2000),
+                Property("height", kPropertyTypeInteger, 20, 10, 50)
+            }),
+            [this](const PropertyList& properties) -> ReturnValue {
+                int steps = properties["steps"].value<int>();
+                int speed = properties["speed"].value<int>();
+                int height = properties["height"].value<int>();
+                std::string command = "SWING " + std::to_string(steps) + " " + 
+                                    std::to_string(speed) + " " + 
+                                    std::to_string(height);
+                std::string response = SendUartCommand(command.c_str());  // 移除超时参数
+                return "摇摆" + std::to_string(steps) + "次 | 状态: " + response;
+            });
+
+        // 手部动作
+        mcp_server.AddTool("self.device.hands_up", "举手动作", 
+            PropertyList({
+                Property("speed", kPropertyTypeInteger, 1000, 500, 2000),
+                Property("direction", kPropertyTypeInteger, 0, -1, 1)  // 0=双手, 1=左手, -1=右手
+            }),
+            [this](const PropertyList& properties) -> ReturnValue {
+                int speed = properties["speed"].value<int>();
+                int direction = properties["direction"].value<int>();
+                std::string command = "HANDS_UP " + std::to_string(speed) + " " + std::to_string(direction);
+                std::string response = SendUartCommand(command.c_str());  // 移除超时参数
+                
+                std::string dir_str = (direction == 0) ? "双手" : ((direction == 1) ? "左手" : "右手");
+                return dir_str + "举起 | 状态: " + response;
+            });
+
+        mcp_server.AddTool("self.device.hands_down", "放手动作", 
+            PropertyList({
+                Property("speed", kPropertyTypeInteger, 1000, 500, 2000),
+                Property("direction", kPropertyTypeInteger, 0, -1, 1)
+            }),
+            [this](const PropertyList& properties) -> ReturnValue {
+                int speed = properties["speed"].value<int>();
+                int direction = properties["direction"].value<int>();
+                std::string command = "HANDS_DOWN " + std::to_string(speed) + " " + std::to_string(direction);
+                std::string response = SendUartCommand(command.c_str());  // 移除超时参数
+                
+                std::string dir_str = (direction == 0) ? "双手" : ((direction == 1) ? "左手" : "右手");
+                return dir_str + "放下 | 状态: " + response;
+            });
+
+        mcp_server.AddTool("self.device.hand_wave", "挥手动作", 
+            PropertyList({
+                Property("speed", kPropertyTypeInteger, 1000, 500, 2000),
+                Property("direction", kPropertyTypeInteger, 1, -1, 1)  // 1=左手, -1=右手, 0=双手
+            }),
+            [this](const PropertyList& properties) -> ReturnValue {
+                int speed = properties["speed"].value<int>();
+                int direction = properties["direction"].value<int>();
+                std::string command = "HAND_WAVE " + std::to_string(speed) + " " + std::to_string(direction);
+                std::string response = SendUartCommand(command.c_str());  // 移除超时参数
+                
+                std::string dir_str = (direction == 1) ? "左手" : ((direction == -1) ? "右手" : "双手");
+                return dir_str + "挥手 | 状态: " + response;
+            });
+
+        // 停止和状态查询 - 参考sparkbot只发送不等待响应
+        mcp_server.AddTool("self.device.stop", "设备停止", PropertyList(),
+            [this](const PropertyList& properties) -> ReturnValue {
+                std::string response = SendUartCommand("STOP");  // 移除超时参数
+                return "停止命令已发送 | 状态: " + response;
+            });
+
+        mcp_server.AddTool("self.device.get_status", "获取设备状态", PropertyList(),
+            [this](const PropertyList& properties) -> ReturnValue {
+                std::string response = SendUartCommand("GET_STATUS");  // 移除超时参数
+                return "设备状态 | 状态: " + response;
+            });
+            
+        ESP_LOGI(TAG, "Lichuang Dev MCP工具注册完成，共注册%d个工具", 16);
     }
 
     void InitializeButtons() {
@@ -410,6 +707,8 @@ public:
         InitializePowerManager();
         InitializeSt7789Display();
         InitializeButtons();
+        InitializeEchoUart();
+        InitializeTools();
         GetBacklight()->RestoreBrightness();
         InitializeBoardPowerManager();
     }
