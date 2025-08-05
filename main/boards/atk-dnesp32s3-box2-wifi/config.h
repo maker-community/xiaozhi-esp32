@@ -68,14 +68,13 @@ enum PowerSupply {
 #define DISPLAY_BACKLIGHT_OUTPUT_INVERT false
 
 /* UART for external device control */
-#define UART_ECHO_TXD GPIO_NUM_43
-#define UART_ECHO_RXD GPIO_NUM_44
+#define UART_ECHO_TXD GPIO_NUM_46
+#define UART_ECHO_RXD GPIO_NUM_45
 #define UART_ECHO_RTS (-1)
 #define UART_ECHO_CTS (-1)
 
-#define ECHO_UART_PORT_NUM      UART_NUM_0
+#define ECHO_UART_PORT_NUM      UART_NUM_1
 #define ECHO_UART_BAUD_RATE     (115200)
 #define BUF_SIZE                (1024)
-
 #endif // _BOARD_CONFIG_H_
 
