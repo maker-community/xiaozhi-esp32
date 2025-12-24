@@ -8,6 +8,7 @@
 #include "i2c_device.h"
 #include "esp32_camera.h"
 #include "mcp_server.h"
+#include "bq27220.h"
 
 #include <esp_log.h>
 #include <esp_lcd_panel_vendor.h>
@@ -72,6 +73,7 @@ private:
     Display* display_;
     Pca9557* pca9557_;
     Esp32Camera* camera_;
+    Bq27220* bq27220_;
 
     void InitializeI2c() {
         // Initialize I2C peripheral
@@ -91,6 +93,12 @@ private:
 
         // Initialize PCA9557
         pca9557_ = new Pca9557(i2c_bus_, 0x19);
+        
+        // Initialize BQ27220 fuel gauge
+        bq27220_ = new Bq27220(i2c_bus_, BQ27220_I2C_ADDRESS);
+        if (!bq27220_->Init()) {
+            ESP_LOGE(TAG, "BQ27220 initialization failed!");
+        }
     }
 
     void InitializeSpi() {
@@ -287,6 +295,53 @@ public:
         return &backlight;
     }
 
+
+    virtual bool GetBatteryLevel(int& level, bool& charging, bool& discharging) override {
+        if (bq27220_ == nullptr) {
+            return false;
+        }
+        
+        // Get basic battery info
+        level = bq27220_->GetBatteryLevel();
+        charging = bq27220_->IsCharging();
+        discharging = bq27220_->IsDischarging();
+        
+        // Get additional battery info for logging
+        int voltage = bq27220_->GetVoltage();
+        int current = bq27220_->GetCurrent();
+        int temp = bq27220_->GetTemperature();
+        int remaining = bq27220_->GetRemainingCapacity();
+        int full_capacity = bq27220_->GetFullCapacity();
+        int cycle_count = bq27220_->GetCycleCount();
+        bool fully_charged = bq27220_->IsFullyCharged();
+        
+        // Log detailed battery status
+        ESP_LOGI(TAG, "Battery Status:");
+        ESP_LOGI(TAG, "  SOC: %d%%, SOH: %d%%", level, bq27220_->GetStateOfHealth());
+        ESP_LOGI(TAG, "  Voltage: %dmV, Current: %dmA, Power: %dmW", 
+                 voltage, current, bq27220_->GetAveragePower());
+        ESP_LOGI(TAG, "  Temp: %d°C", temp);
+        ESP_LOGI(TAG, "  Capacity: %d/%d mAh, Cycles: %d", 
+                 remaining, full_capacity, cycle_count);
+        ESP_LOGI(TAG, "  Charging: %d, Discharging: %d, Full: %d", 
+                 charging, discharging, fully_charged);
+        
+        // Log time estimates if available
+        if (discharging) {
+            int tte = bq27220_->GetTimeToEmpty();
+            if (tte < 65535) {  // Valid reading
+                ESP_LOGI(TAG, "  Time to Empty: %d minutes", tte);
+            }
+        }
+        if (charging) {
+            int ttf = bq27220_->GetTimeToFull();
+            if (ttf < 65535) {  // Valid reading
+                ESP_LOGI(TAG, "  Time to Full: %d minutes", ttf);
+            }
+        }
+        
+        return true;
+    }
     virtual Camera* GetCamera() override {
         return camera_;
     }
