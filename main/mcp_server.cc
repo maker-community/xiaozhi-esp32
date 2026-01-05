@@ -18,6 +18,7 @@
 #include "lvgl_theme.h"
 #include "lvgl_display.h"
 #include "keycloak_auth.h"
+#include "assets/lang_config.h"
 
 #define TAG "MCP"
 
@@ -358,7 +359,7 @@ void McpServer::AddUserOnlyTools() {
                     if (ret != ESP_OK) {
                         ESP_LOGE(TAG, "Failed to request device code from Keycloak");
                         auto& app = Application::GetInstance();
-                        app.Alert("Login Error", "Failed to start login process", "triangle_exclamation", "");
+                        app.Alert(Lang::Strings::LOGIN_ERROR, Lang::Strings::LOGIN_ERROR_START_FAILED, "triangle_exclamation", "");
                         vTaskDelay(pdMS_TO_TICKS(2000));
                         app.DismissAlert();
                         return;
@@ -383,8 +384,9 @@ void McpServer::AddUserOnlyTools() {
                     // 显示真正的二维码
                     auto display = board.GetDisplay();
                     if (display != nullptr) {
-                        std::string subtitle = "User Code: " + device_response.user_code;
-                        display->ShowQRCode(display_url.c_str(), "Keycloak Login", subtitle.c_str());
+                        char subtitle[64];
+                        snprintf(subtitle, sizeof(subtitle), Lang::Strings::LOGIN_USER_CODE, device_response.user_code.c_str());
+                        display->ShowQRCode(display_url.c_str(), Lang::Strings::LOGIN_QR_TITLE, subtitle);
                     }
                     
                     ESP_LOGI(TAG, "Login QR code displayed on device screen");
@@ -422,7 +424,7 @@ void McpServer::AddUserOnlyTools() {
                                 display->HideQRCode();
                             }
                             auto& app = Application::GetInstance();
-                            app.Alert("Login Error", "Authentication failed", "triangle_exclamation", "");
+                            app.Alert(Lang::Strings::LOGIN_ERROR, Lang::Strings::LOGIN_ERROR_AUTH_FAILED, "triangle_exclamation", "");
                             vTaskDelay(pdMS_TO_TICKS(2000));
                             app.Alert("", "", "", "");  // 清除提示
                             return;
@@ -435,7 +437,7 @@ void McpServer::AddUserOnlyTools() {
                         }
                         auto& app = Application::GetInstance();
                         ESP_LOGW(TAG, "Login timeout - user did not complete authentication within %d seconds", timeout);
-                        app.Alert("Login Timeout", "Please try again", "triangle_exclamation", "");
+                        app.Alert(Lang::Strings::LOGIN_TIMEOUT, Lang::Strings::LOGIN_TIMEOUT_MESSAGE, "triangle_exclamation", "");
                         vTaskDelay(pdMS_TO_TICKS(2000));
                         app.Alert("", "", "", "");  // 清除提示
                         return;
@@ -454,7 +456,7 @@ void McpServer::AddUserOnlyTools() {
                     }
                     
                     auto& app = Application::GetInstance();
-                    app.Alert("Login Success", "You are now logged in!", "check_circle", "");
+                    app.Alert(Lang::Strings::LOGIN_SUCCESS, Lang::Strings::LOGIN_SUCCESS_MESSAGE, "check_circle", "");
                     vTaskDelay(pdMS_TO_TICKS(2000));
                     app.Alert("", "", "", "");  // 清除提示
                     
