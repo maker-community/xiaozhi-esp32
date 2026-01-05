@@ -34,6 +34,7 @@ set(SOURCES "audio/audio_codec.cc"
             "ota.cc"
             "settings.cc"
             "device_state_machine.cc"
+            "keycloak_auth.cc"
             "assets.cc"
             "main.cc"
             )

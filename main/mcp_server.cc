@@ -17,6 +17,7 @@
 #include "settings.h"
 #include "lvgl_theme.h"
 #include "lvgl_display.h"
+#include "keycloak_auth.h"
 
 #define TAG "MCP"
 
@@ -298,6 +299,161 @@ void McpServer::AddUserOnlyTools() {
                 return true;
             });
     }
+
+    // Keycloak authentication (unified tool)
+    AddUserOnlyTool("keycloak",
+        "Keycloak authentication management. Use this tool when user wants to:\n"
+        "- Check login status or ask 'am I logged in?'\n"
+        "- Login to Keycloak account (shows QR code on device screen)\n"
+        "- Logout or sign out from account\n"
+        "\n"
+        "Actions:\n"
+        "- 'check': Returns whether user is currently authenticated\n"
+        "- 'login': Starts OAuth2 device flow, displays QR code and user code on device, waits for user to authorize on phone/computer\n"
+        "- 'logout': Clears authentication tokens\n"
+        "\n"
+        "Server: https://auth.verdure-hiro.cn/ (realm: maker-community)",
+        PropertyList({
+            Property("action", kPropertyTypeString)
+        }),
+        [](const PropertyList& properties) -> ReturnValue {
+            auto action = properties["action"].value<std::string>();
+            
+            // 从配置读取服务器信息
+            Settings settings("keycloak", false);
+            std::string server_url = settings.GetString("server_url", "https://auth.verdure-hiro.cn/");
+            std::string realm = settings.GetString("realm", "maker-community");
+            std::string client_id = settings.GetString("client_id", "verdure-assistant");
+            
+            if (action == "check") {
+                KeycloakAuth auth(server_url, realm, client_id);
+                cJSON* result = cJSON_CreateObject();
+                cJSON_AddStringToObject(result, "action", "check");
+                bool is_authenticated = auth.IsAuthenticated();
+                cJSON_AddBoolToObject(result, "authenticated", is_authenticated);
+                
+                if (is_authenticated) {
+                    auto token = auth.GetAccessToken();
+                    ESP_LOGI(TAG, "User is authenticated. Token length: %d", token.length());
+                    ESP_LOGD(TAG, "Access token: %.50s...", token.c_str());
+                    
+                    cJSON_AddStringToObject(result, "status", "logged_in");
+                    cJSON_AddStringToObject(result, "message", "You are currently logged in to Keycloak.");
+                } else {
+                    ESP_LOGI(TAG, "User is not authenticated");
+                    cJSON_AddStringToObject(result, "status", "not_logged_in");
+                    cJSON_AddStringToObject(result, "message", "You are not logged in. Please use action=login to authenticate.");
+                }
+                return result;
+                
+            } else if (action == "login") {
+                KeycloakAuth auth(server_url, realm, client_id);
+                
+                KeycloakAuth::DeviceCodeResponse device_response;
+                esp_err_t ret = auth.RequestDeviceCode(device_response);
+                if (ret != ESP_OK) {
+                    ESP_LOGE(TAG, "Failed to request device code from Keycloak");
+                    throw std::runtime_error("Failed to request device code from Keycloak");
+                }
+                
+                ESP_LOGI(TAG, "Device code obtained successfully");
+                ESP_LOGI(TAG, "User code: %s", device_response.user_code.c_str());
+                ESP_LOGI(TAG, "Verification URI: %s", device_response.verification_uri.c_str());
+                if (!device_response.verification_uri_complete.empty()) {
+                    ESP_LOGI(TAG, "Complete URI: %s", device_response.verification_uri_complete.c_str());
+                }
+                ESP_LOGI(TAG, "Expires in: %d seconds", device_response.expires_in);
+                
+                // 使用服务器返回的超时时间
+                int timeout = device_response.expires_in;
+                
+                // 优先使用完整URL（包含user_code），扫码更方便
+                std::string display_url = device_response.verification_uri_complete.empty() 
+                    ? device_response.verification_uri 
+                    : device_response.verification_uri_complete;
+                std::string message = "Please scan QR code or visit:\n" + display_url + "\nUser Code: " + device_response.user_code;
+                auto& app = Application::GetInstance();
+                app.Alert("Keycloak Login", message.c_str(), "qrcode");
+                
+                ESP_LOGI(TAG, "Login QR code displayed on device screen");
+                ESP_LOGI(TAG, "Starting token polling (interval: %ds, timeout: %ds)", device_response.interval, timeout);
+                
+                int poll_interval = device_response.interval;
+                int max_attempts = timeout / poll_interval;
+                bool success = false;
+                KeycloakAuth::TokenResponse token_response;
+                
+                // 立即开始第一次轮询，然后每隔interval秒轮询一次
+                for (int i = 0; i < max_attempts; i++) {
+                    if (i > 0) {
+                        vTaskDelay(pdMS_TO_TICKS(poll_interval * 1000));
+                    }
+                    
+                    ESP_LOGD(TAG, "Polling token... attempt %d/%d", i + 1, max_attempts);
+                    ret = auth.PollToken(device_response.device_code, token_response);
+                    
+                    if (ret == ESP_OK) {
+                        success = true;
+                        ESP_LOGI(TAG, "Token obtained successfully");
+                        break;
+                    } else if (ret == ESP_ERR_TIMEOUT) {
+                        // authorization_pending 或 slow_down，继续等待
+                        continue;
+                    } else {
+                        // 其他错误
+                        app.DismissAlert();
+                        throw std::runtime_error("Failed to poll token from Keycloak");
+                    }
+                }
+                
+                if (!success) {
+                    app.DismissAlert();
+                    ESP_LOGW(TAG, "Login timeout - user did not complete authentication within %d seconds", timeout);
+                    throw std::runtime_error("Login timeout. User did not complete authentication.");
+                }
+                
+                ESP_LOGI(TAG, "Authentication successful, saving tokens");
+                auto token = token_response.access_token;
+                ESP_LOGI(TAG, "Access token obtained (length: %d)", token.length());
+                ESP_LOGD(TAG, "Token preview: %.50s...", token.c_str());
+                
+                auth.SaveTokens(token_response);
+                app.DismissAlert();
+                app.Alert("Login Success", "You are now logged in!", "check_circle", "");
+                vTaskDelay(pdMS_TO_TICKS(2000));
+                app.DismissAlert();
+                
+                ESP_LOGI(TAG, "Login flow completed successfully");
+                
+                cJSON* result = cJSON_CreateObject();
+                cJSON_AddStringToObject(result, "action", "login");
+                cJSON_AddBoolToObject(result, "success", true);
+                cJSON_AddStringToObject(result, "status", "authenticated");
+                cJSON_AddStringToObject(result, "message", "Login successful! You are now authenticated with Keycloak. Tokens have been saved securely.");
+                return result;
+                
+            } else if (action == "logout") {
+                KeycloakAuth auth(server_url, realm, client_id);
+                bool was_logged_in = auth.IsAuthenticated();
+                auth.ClearTokens();
+                
+                ESP_LOGI(TAG, "User logged out successfully (was authenticated: %s)", was_logged_in ? "yes" : "no");
+                
+                cJSON* result = cJSON_CreateObject();
+                cJSON_AddStringToObject(result, "action", "logout");
+                cJSON_AddBoolToObject(result, "success", true);
+                cJSON_AddStringToObject(result, "status", "logged_out");
+                if (was_logged_in) {
+                    cJSON_AddStringToObject(result, "message", "You have been logged out successfully. All authentication tokens have been cleared.");
+                } else {
+                    cJSON_AddStringToObject(result, "message", "You were not logged in. No tokens to clear.");
+                }
+                return result;
+                
+            } else {
+                throw std::runtime_error("Invalid action. Use: check, login, or logout");
+            }
+        });
 }
 
 void McpServer::AddTool(McpTool* tool) {
