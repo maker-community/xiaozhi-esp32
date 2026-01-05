@@ -301,7 +301,8 @@ void McpServer::AddUserOnlyTools() {
     }
 
     // Keycloak authentication (unified tool)
-    AddUserOnlyTool("keycloak",
+    ESP_LOGI(TAG, "Adding Keycloak authentication tool...");
+    AddTool("keycloak",
         "Keycloak authentication management. Use this tool when user wants to:\n"
         "- Check login status or ask 'am I logged in?'\n"
         "- Login to Keycloak account (shows QR code on device screen)\n"
@@ -335,7 +336,7 @@ void McpServer::AddUserOnlyTools() {
                 if (is_authenticated) {
                     auto token = auth.GetAccessToken();
                     ESP_LOGI(TAG, "User is authenticated. Token length: %d", token.length());
-                    ESP_LOGD(TAG, "Access token: %.50s...", token.c_str());
+                    ESP_LOGI(TAG, "Access token: %.50s...", token.c_str());
                     
                     cJSON_AddStringToObject(result, "status", "logged_in");
                     cJSON_AddStringToObject(result, "message", "You are currently logged in to Keycloak.");
@@ -347,89 +348,110 @@ void McpServer::AddUserOnlyTools() {
                 return result;
                 
             } else if (action == "login") {
-                KeycloakAuth auth(server_url, realm, client_id);
-                
-                KeycloakAuth::DeviceCodeResponse device_response;
-                esp_err_t ret = auth.RequestDeviceCode(device_response);
-                if (ret != ESP_OK) {
-                    ESP_LOGE(TAG, "Failed to request device code from Keycloak");
-                    throw std::runtime_error("Failed to request device code from Keycloak");
-                }
-                
-                ESP_LOGI(TAG, "Device code obtained successfully");
-                ESP_LOGI(TAG, "User code: %s", device_response.user_code.c_str());
-                ESP_LOGI(TAG, "Verification URI: %s", device_response.verification_uri.c_str());
-                if (!device_response.verification_uri_complete.empty()) {
-                    ESP_LOGI(TAG, "Complete URI: %s", device_response.verification_uri_complete.c_str());
-                }
-                ESP_LOGI(TAG, "Expires in: %d seconds", device_response.expires_in);
-                
-                // 使用服务器返回的超时时间
-                int timeout = device_response.expires_in;
-                
-                // 优先使用完整URL（包含user_code），扫码更方便
-                std::string display_url = device_response.verification_uri_complete.empty() 
-                    ? device_response.verification_uri 
-                    : device_response.verification_uri_complete;
-                std::string message = "Please scan QR code or visit:\n" + display_url + "\nUser Code: " + device_response.user_code;
-                auto& app = Application::GetInstance();
-                app.Alert("Keycloak Login", message.c_str(), "qrcode");
-                
-                ESP_LOGI(TAG, "Login QR code displayed on device screen");
-                ESP_LOGI(TAG, "Starting token polling (interval: %ds, timeout: %ds)", device_response.interval, timeout);
-                
-                int poll_interval = device_response.interval;
-                int max_attempts = timeout / poll_interval;
-                bool success = false;
-                KeycloakAuth::TokenResponse token_response;
-                
-                // 立即开始第一次轮询，然后每隔interval秒轮询一次
-                for (int i = 0; i < max_attempts; i++) {
-                    if (i > 0) {
-                        vTaskDelay(pdMS_TO_TICKS(poll_interval * 1000));
-                    }
+                // 在独立任务中执行登录，避免阻塞主线程
+                auto login_task = [server_url, realm, client_id]() {
+                    KeycloakAuth auth(server_url, realm, client_id);
                     
-                    ESP_LOGD(TAG, "Polling token... attempt %d/%d", i + 1, max_attempts);
-                    ret = auth.PollToken(device_response.device_code, token_response);
-                    
-                    if (ret == ESP_OK) {
-                        success = true;
-                        ESP_LOGI(TAG, "Token obtained successfully");
-                        break;
-                    } else if (ret == ESP_ERR_TIMEOUT) {
-                        // authorization_pending 或 slow_down，继续等待
-                        continue;
-                    } else {
-                        // 其他错误
+                    KeycloakAuth::DeviceCodeResponse device_response;
+                    esp_err_t ret = auth.RequestDeviceCode(device_response);
+                    if (ret != ESP_OK) {
+                        ESP_LOGE(TAG, "Failed to request device code from Keycloak");
+                        auto& app = Application::GetInstance();
+                        app.Alert("Login Error", "Failed to start login process", "triangle_exclamation", "");
+                        vTaskDelay(pdMS_TO_TICKS(2000));
                         app.DismissAlert();
-                        throw std::runtime_error("Failed to poll token from Keycloak");
+                        return;
                     }
-                }
-                
-                if (!success) {
+                    
+                    ESP_LOGI(TAG, "Device code obtained successfully");
+                    ESP_LOGI(TAG, "User code: %s", device_response.user_code.c_str());
+                    ESP_LOGI(TAG, "Verification URI: %s", device_response.verification_uri.c_str());
+                    if (!device_response.verification_uri_complete.empty()) {
+                        ESP_LOGI(TAG, "Complete URI: %s", device_response.verification_uri_complete.c_str());
+                    }
+                    ESP_LOGI(TAG, "Expires in: %d seconds", device_response.expires_in);
+                    
+                    // 使用服务器返回的超时时间
+                    int timeout = device_response.expires_in;
+                    
+                    // 优先使用完整URL（包含user_code），扫码更方便
+                    std::string display_url = device_response.verification_uri_complete.empty() 
+                        ? device_response.verification_uri 
+                        : device_response.verification_uri_complete;
+                    std::string message = "Please scan QR code or visit:\n" + display_url + "\nUser Code: " + device_response.user_code;
+                    auto& app = Application::GetInstance();
+                    app.Alert("Keycloak Login", message.c_str(), "qrcode");
+                    
+                    ESP_LOGI(TAG, "Login QR code displayed on device screen");
+                    ESP_LOGI(TAG, "Starting token polling (interval: %ds, timeout: %ds)", device_response.interval, timeout);
+                    
+                    int poll_interval = device_response.interval;
+                    int max_attempts = timeout / poll_interval;
+                    bool success = false;
+                    KeycloakAuth::TokenResponse token_response;
+                    
+                    // 立即开始第一次轮询，然后每隔interval秒轮询一次
+                    for (int i = 0; i < max_attempts; i++) {
+                        if (i > 0) {
+                            vTaskDelay(pdMS_TO_TICKS(poll_interval * 1000));
+                        }
+                        
+                        ESP_LOGD(TAG, "Polling token... attempt %d/%d", i + 1, max_attempts);
+                        ret = auth.PollToken(device_response.device_code, token_response);
+                        
+                        if (ret == ESP_OK) {
+                            success = true;
+                            ESP_LOGI(TAG, "Token obtained successfully");
+                            break;
+                        } else if (ret == ESP_ERR_TIMEOUT) {
+                            // authorization_pending 或 slow_down，继续等待
+                            continue;
+                        } else {
+                            // 其他错误
+                            ESP_LOGE(TAG, "Failed to poll token from Keycloak");
+                            app.DismissAlert();
+                            app.Alert("Login Error", "Authentication failed", "triangle_exclamation", "");
+                            vTaskDelay(pdMS_TO_TICKS(2000));
+                            app.DismissAlert();
+                            return;
+                        }
+                    }
+                    
+                    if (!success) {
+                        app.DismissAlert();
+                        ESP_LOGW(TAG, "Login timeout - user did not complete authentication within %d seconds", timeout);
+                        app.Alert("Login Timeout", "Please try again", "triangle_exclamation", "");
+                        vTaskDelay(pdMS_TO_TICKS(2000));
+                        app.DismissAlert();
+                        return;
+                    }
+                    
+                    ESP_LOGI(TAG, "Authentication successful, saving tokens");
+                    auto token = token_response.access_token;
+                    ESP_LOGI(TAG, "Access token obtained (length: %d)", token.length());
+                    ESP_LOGI(TAG, "Token preview: %.50s...", token.c_str());
+                    
+                    auth.SaveTokens(token_response);
                     app.DismissAlert();
-                    ESP_LOGW(TAG, "Login timeout - user did not complete authentication within %d seconds", timeout);
-                    throw std::runtime_error("Login timeout. User did not complete authentication.");
-                }
+                    app.Alert("Login Success", "You are now logged in!", "check_circle", "");
+                    vTaskDelay(pdMS_TO_TICKS(2000));
+                    app.DismissAlert();
+                    
+                    ESP_LOGI(TAG, "Login flow completed successfully");
+                };
                 
-                ESP_LOGI(TAG, "Authentication successful, saving tokens");
-                auto token = token_response.access_token;
-                ESP_LOGI(TAG, "Access token obtained (length: %d)", token.length());
-                ESP_LOGD(TAG, "Token preview: %.50s...", token.c_str());
-                
-                auth.SaveTokens(token_response);
-                app.DismissAlert();
-                app.Alert("Login Success", "You are now logged in!", "check_circle", "");
-                vTaskDelay(pdMS_TO_TICKS(2000));
-                app.DismissAlert();
-                
-                ESP_LOGI(TAG, "Login flow completed successfully");
+                // 创建独立任务执行登录，不阻塞主线程
+                xTaskCreate([](void* arg) {
+                    auto task = static_cast<std::function<void()>*>(arg);
+                    (*task)();
+                    delete task;
+                    vTaskDelete(nullptr);
+                }, "keycloak_login", 8192, new std::function<void()>(login_task), 5, nullptr);
                 
                 cJSON* result = cJSON_CreateObject();
                 cJSON_AddStringToObject(result, "action", "login");
-                cJSON_AddBoolToObject(result, "success", true);
-                cJSON_AddStringToObject(result, "status", "authenticated");
-                cJSON_AddStringToObject(result, "message", "Login successful! You are now authenticated with Keycloak. Tokens have been saved securely.");
+                cJSON_AddStringToObject(result, "status", "started");
+                cJSON_AddStringToObject(result, "message", "Login process started. Please scan the QR code displayed on the device screen.");
                 return result;
                 
             } else if (action == "logout") {
