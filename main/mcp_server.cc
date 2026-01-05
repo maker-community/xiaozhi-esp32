@@ -350,6 +350,7 @@ void McpServer::AddUserOnlyTools() {
             } else if (action == "login") {
                 // 在独立任务中执行登录，避免阻塞主线程
                 auto login_task = [server_url, realm, client_id]() {
+                    auto& board = Board::GetInstance();
                     KeycloakAuth auth(server_url, realm, client_id);
                     
                     KeycloakAuth::DeviceCodeResponse device_response;
@@ -378,11 +379,17 @@ void McpServer::AddUserOnlyTools() {
                     std::string display_url = device_response.verification_uri_complete.empty() 
                         ? device_response.verification_uri 
                         : device_response.verification_uri_complete;
-                    std::string message = "Please scan QR code or visit:\n" + display_url + "\nUser Code: " + device_response.user_code;
-                    auto& app = Application::GetInstance();
-                    app.Alert("Keycloak Login", message.c_str(), "qrcode");
+                    
+                    // 显示真正的二维码
+                    auto display = board.GetDisplay();
+                    if (display != nullptr) {
+                        std::string subtitle = "User Code: " + device_response.user_code;
+                        display->ShowQRCode(display_url.c_str(), "Keycloak Login", subtitle.c_str());
+                    }
                     
                     ESP_LOGI(TAG, "Login QR code displayed on device screen");
+                    ESP_LOGI(TAG, "URL: %s", display_url.c_str());
+                    ESP_LOGI(TAG, "User Code: %s", device_response.user_code.c_str());
                     ESP_LOGI(TAG, "Starting token polling (interval: %ds, timeout: %ds)", device_response.interval, timeout);
                     
                     int poll_interval = device_response.interval;
@@ -396,8 +403,7 @@ void McpServer::AddUserOnlyTools() {
                             vTaskDelay(pdMS_TO_TICKS(poll_interval * 1000));
                         }
                         
-                        // 每次轮询前重新显示二维码，确保不被其他消息覆盖
-                        app.Alert("Keycloak Login", message.c_str(), "qrcode");
+                        // 不需要每次都重新显示二维码，因为它会一直显示直到隐藏
                         
                         ESP_LOGD(TAG, "Polling token... attempt %d/%d", i + 1, max_attempts);
                         ret = auth.PollToken(device_response.device_code, token_response);
@@ -412,20 +418,26 @@ void McpServer::AddUserOnlyTools() {
                         } else {
                             // 其他错误
                             ESP_LOGE(TAG, "Failed to poll token from Keycloak");
-                            app.DismissAlert();
+                            if (display != nullptr) {
+                                display->HideQRCode();
+                            }
+                            auto& app = Application::GetInstance();
                             app.Alert("Login Error", "Authentication failed", "triangle_exclamation", "");
                             vTaskDelay(pdMS_TO_TICKS(2000));
-                            app.DismissAlert();
+                            app.Alert("", "", "", "");  // 清除提示
                             return;
                         }
                     }
                     
                     if (!success) {
-                        app.DismissAlert();
+                        if (display != nullptr) {
+                            display->HideQRCode();
+                        }
+                        auto& app = Application::GetInstance();
                         ESP_LOGW(TAG, "Login timeout - user did not complete authentication within %d seconds", timeout);
                         app.Alert("Login Timeout", "Please try again", "triangle_exclamation", "");
                         vTaskDelay(pdMS_TO_TICKS(2000));
-                        app.DismissAlert();
+                        app.Alert("", "", "", "");  // 清除提示
                         return;
                     }
                     
@@ -435,10 +447,16 @@ void McpServer::AddUserOnlyTools() {
                     ESP_LOGI(TAG, "Token preview: %.50s...", token.c_str());
                     
                     auth.SaveTokens(token_response);
-                    app.DismissAlert();
+                    
+                    // 隐藏二维码
+                    if (display != nullptr) {
+                        display->HideQRCode();
+                    }
+                    
+                    auto& app = Application::GetInstance();
                     app.Alert("Login Success", "You are now logged in!", "check_circle", "");
                     vTaskDelay(pdMS_TO_TICKS(2000));
-                    app.DismissAlert();
+                    app.Alert("", "", "", "");  // 清除提示
                     
                     ESP_LOGI(TAG, "Login flow completed successfully");
                 };

@@ -39,6 +39,8 @@ public:
     virtual Theme* GetTheme() { return current_theme_; }
     virtual void UpdateStatusBar(bool update_all = false);
     virtual void SetPowerSaveMode(bool on);
+    virtual void ShowQRCode(const char* data, const char* title = nullptr, const char* subtitle = nullptr);
+    virtual void HideQRCode();
 
     inline int width() const { return width_; }
     inline int height() const { return height_; }

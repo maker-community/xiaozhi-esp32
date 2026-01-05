@@ -4,6 +4,7 @@
 #include <cstdlib>
 #include <cstring>
 #include <font_awesome.h>
+#include <qrcode.h>
 
 #include "lvgl_display.h"
 #include "board.h"
@@ -14,6 +15,17 @@
 #include "jpg/image_to_jpeg.h"
 
 #define TAG "Display"
+
+// QR code context structure for callback
+struct QRContext {
+    LvglDisplay* display;
+    const char* title;
+    const char* subtitle;
+    bool success;
+};
+
+// Static variable to pass context to C callback function
+static QRContext* s_qr_context = nullptr;
 
 LvglDisplay::LvglDisplay() {
     // Notification timer
@@ -255,4 +267,155 @@ bool LvglDisplay::SnapshotToJpeg(std::string& jpeg_data, int quality) {
     ESP_LOGE(TAG, "LV_USE_SNAPSHOT is not enabled");
     return false;
 #endif
+}
+
+void LvglDisplay::ShowQRCode(const char* data, const char* title, const char* subtitle) {
+    DisplayLockGuard lock(this);
+    
+    // Hide existing QR code if any
+    if (qrcode_container_ != nullptr) {
+        lv_obj_delete(qrcode_container_);
+        qrcode_container_ = nullptr;
+        qrcode_obj_ = nullptr;
+    }
+    
+    if (data == nullptr || strlen(data) == 0) {
+        ESP_LOGW(TAG, "QR code data is empty");
+        return;
+    }
+    
+    ESP_LOGI(TAG, "Showing QR code: %s", data);
+    
+    // Create context for the callback
+    QRContext context = {this, title, subtitle, false};
+    
+    // Generate QR code with display callback
+    esp_qrcode_config_t cfg = {
+        .display_func = [](esp_qrcode_handle_t qrcode) {
+            // Get context from static variable (workaround for C function pointer limitation)
+            QRContext* ctx = s_qr_context;
+            if (ctx == nullptr || ctx->display == nullptr) {
+                return;
+            }
+            
+            LvglDisplay* disp = ctx->display;
+            int qr_size = esp_qrcode_get_size(qrcode);
+            ESP_LOGI(TAG, "QR code generated, size: %d", qr_size);
+            
+            // Create full-screen container with semi-transparent background
+            disp->qrcode_container_ = lv_obj_create(lv_screen_active());
+            lv_obj_set_size(disp->qrcode_container_, LV_HOR_RES, LV_VER_RES);
+            lv_obj_set_pos(disp->qrcode_container_, 0, 0);
+            lv_obj_set_style_bg_color(disp->qrcode_container_, lv_color_black(), 0);
+            lv_obj_set_style_bg_opa(disp->qrcode_container_, LV_OPA_90, 0);
+            lv_obj_set_style_border_width(disp->qrcode_container_, 0, 0);
+            lv_obj_set_style_radius(disp->qrcode_container_, 0, 0);
+            lv_obj_set_style_pad_all(disp->qrcode_container_, 20, 0);
+            lv_obj_set_flex_flow(disp->qrcode_container_, LV_FLEX_FLOW_COLUMN);
+            lv_obj_set_flex_align(disp->qrcode_container_, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
+            
+            // Add title if provided
+            if (ctx->title != nullptr && strlen(ctx->title) > 0) {
+                lv_obj_t* title_label = lv_label_create(disp->qrcode_container_);
+                lv_label_set_text(title_label, ctx->title);
+                lv_obj_set_style_text_color(title_label, lv_color_white(), 0);
+                lv_obj_set_style_text_align(title_label, LV_TEXT_ALIGN_CENTER, 0);
+                lv_obj_set_style_pad_bottom(title_label, 10, 0);
+            }
+            
+            // Calculate QR code display size
+            int scale = 3; // Pixel scale factor
+            int canvas_size = qr_size * scale;
+            int max_size = (LV_HOR_RES < LV_VER_RES ? LV_HOR_RES : LV_VER_RES) - 100;
+            
+            // Adjust scale if too large
+            while (canvas_size > max_size && scale > 1) {
+                scale--;
+                canvas_size = qr_size * scale;
+            }
+            
+            disp->qrcode_obj_ = lv_canvas_create(disp->qrcode_container_);
+            
+            // Allocate buffer for canvas (RGB565 format for LVGL 9.x)
+            size_t buf_size = canvas_size * canvas_size * sizeof(lv_color_t);
+            lv_color_t* canvas_buf = (lv_color_t*)heap_caps_malloc(buf_size, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+            if (canvas_buf == nullptr) {
+                canvas_buf = (lv_color_t*)malloc(buf_size);
+            }
+            
+            if (canvas_buf == nullptr) {
+                ESP_LOGE(TAG, "Failed to allocate canvas buffer");
+                lv_obj_delete(disp->qrcode_container_);
+                disp->qrcode_container_ = nullptr;
+                disp->qrcode_obj_ = nullptr;
+                return;
+            }
+            
+            // Set buffer to canvas first
+            lv_canvas_set_buffer(disp->qrcode_obj_, canvas_buf, canvas_size, canvas_size, LV_COLOR_FORMAT_RGB565);
+            
+            // Fill with white background
+            lv_canvas_fill_bg(disp->qrcode_obj_, lv_color_white(), LV_OPA_COVER);
+            
+            // Draw QR code modules using lv_canvas_set_px for correct pixel placement
+            lv_color_t black = lv_color_black();
+            for (int y = 0; y < qr_size; y++) {
+                for (int x = 0; x < qr_size; x++) {
+                    if (esp_qrcode_get_module(qrcode, x, y)) {
+                        // Fill scaled block with black pixels using LVGL API
+                        for (int dy = 0; dy < scale; dy++) {
+                            for (int dx = 0; dx < scale; dx++) {
+                                lv_canvas_set_px(disp->qrcode_obj_, x * scale + dx, y * scale + dy, black, LV_OPA_COVER);
+                            }
+                        }
+                    }
+                }
+            }
+            
+            // Add white border around QR code
+            lv_obj_set_style_bg_color(disp->qrcode_obj_, lv_color_white(), 0);
+            lv_obj_set_style_bg_opa(disp->qrcode_obj_, LV_OPA_COVER, 0);
+            lv_obj_set_style_pad_all(disp->qrcode_obj_, 10, 0);
+            
+            // Add subtitle if provided
+            if (ctx->subtitle != nullptr && strlen(ctx->subtitle) > 0) {
+                lv_obj_t* subtitle_label = lv_label_create(disp->qrcode_container_);
+                lv_label_set_text(subtitle_label, ctx->subtitle);
+                lv_label_set_long_mode(subtitle_label, LV_LABEL_LONG_WRAP);
+                lv_obj_set_width(subtitle_label, LV_HOR_RES - 40);
+                lv_obj_set_style_text_color(subtitle_label, lv_color_white(), 0);
+                lv_obj_set_style_text_align(subtitle_label, LV_TEXT_ALIGN_CENTER, 0);
+                lv_obj_set_style_pad_top(subtitle_label, 10, 0);
+            }
+            
+            ctx->success = true;
+            ESP_LOGI(TAG, "QR code displayed successfully");
+        },
+        .max_qrcode_version = 10,
+        .qrcode_ecc_level = ESP_QRCODE_ECC_LOW,
+    };
+    
+    // Store context in static variable for callback access
+    s_qr_context = &context;
+    
+    esp_err_t ret = esp_qrcode_generate(&cfg, data);
+    
+    // Clear static context
+    s_qr_context = nullptr;
+    
+    if (ret != ESP_OK || !context.success) {
+        ESP_LOGE(TAG, "Failed to generate or display QR code: %d", ret);
+        return;
+    }
+}
+
+void LvglDisplay::HideQRCode() {
+    DisplayLockGuard lock(this);
+    
+    if (qrcode_container_ != nullptr) {
+        lv_obj_delete(qrcode_container_);
+        qrcode_container_ = nullptr;
+        qrcode_obj_ = nullptr;
+        ESP_LOGI(TAG, "QR code hidden");
+    }
 }

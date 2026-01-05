@@ -54,3 +54,11 @@ void Display::SetTheme(Theme* theme) {
 void Display::SetPowerSaveMode(bool on) {
     ESP_LOGW(TAG, "SetPowerSaveMode: %d", on);
 }
+
+void Display::ShowQRCode(const char* data, const char* title, const char* subtitle) {
+    ESP_LOGW(TAG, "ShowQRCode: %s", data);
+}
+
+void Display::HideQRCode() {
+    ESP_LOGW(TAG, "HideQRCode");
+}
