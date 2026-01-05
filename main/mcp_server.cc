@@ -396,6 +396,9 @@ void McpServer::AddUserOnlyTools() {
                             vTaskDelay(pdMS_TO_TICKS(poll_interval * 1000));
                         }
                         
+                        // 每次轮询前重新显示二维码，确保不被其他消息覆盖
+                        app.Alert("Keycloak Login", message.c_str(), "qrcode");
+                        
                         ESP_LOGD(TAG, "Polling token... attempt %d/%d", i + 1, max_attempts);
                         ret = auth.PollToken(device_response.device_code, token_response);
                         
