@@ -253,6 +253,23 @@ void Application::Run() {
             if (clock_ticks_ % 10 == 0) {
                 SystemInfo::PrintHeapStats();
             }
+
+#ifdef CONFIG_ENABLE_SIGNALR_CLIENT
+            // Check SignalR reconnection every 5 seconds
+            if (clock_ticks_ % 5 == 0) {
+                auto& signalr = SignalRClient::GetInstance();
+                if (signalr.IsInitialized()) {
+                    bool needs = signalr.NeedsReconnect();
+                    bool connected = signalr.IsConnected();
+                    if (needs || !connected) {
+                        ESP_LOGI(TAG, "SignalR check: needs_reconnect=%d, connected=%d", needs ? 1 : 0, connected ? 1 : 0);
+                    }
+                    if (needs) {
+                        signalr.PerformReconnect();
+                    }
+                }
+            }
+#endif
         }
     }
 }
@@ -275,6 +292,19 @@ void Application::HandleNetworkConnectedEvent() {
             app->activation_task_handle_ = nullptr;
             vTaskDelete(NULL);
         }, "activation", 4096 * 2, this, 2, &activation_task_handle_);
+    } else {
+#ifdef CONFIG_ENABLE_SIGNALR_CLIENT
+        // Network restored after disconnection, try to reconnect SignalR
+        auto& signalr = SignalRClient::GetInstance();
+        if (signalr.IsInitialized()) {
+            // Re-enable auto-reconnect now that network is back
+            signalr.SetAutoReconnectEnabled(true);
+            if (!signalr.IsConnected()) {
+                ESP_LOGI(TAG, "Network restored, attempting SignalR reconnection");
+                signalr.Reconnect();
+            }
+        }
+#endif
     }
 
     // Update the status bar immediately to show the network state
@@ -289,6 +319,16 @@ void Application::HandleNetworkDisconnectedEvent() {
         ESP_LOGI(TAG, "Closing audio channel due to network disconnection");
         protocol_->CloseAudioChannel();
     }
+
+#ifdef CONFIG_ENABLE_SIGNALR_CLIENT
+    // Disable auto-reconnect and disconnect SignalR when network is lost
+    auto& signalr = SignalRClient::GetInstance();
+    if (signalr.IsInitialized()) {
+        ESP_LOGI(TAG, "Disconnecting SignalR due to network loss");
+        signalr.SetAutoReconnectEnabled(false);  // Disable reconnect attempts while network is down
+        signalr.Disconnect();
+    }
+#endif
 
     // Update the status bar immediately to show the network state
     auto display = Board::GetInstance().GetDisplay();

@@ -75,9 +75,24 @@ bool SignalRClient::Initialize(const std::string& hub_url, const std::string& to
         cfg.set_handshake_timeout(std::chrono::seconds(30));   // generous handshake
         connection_->set_client_config(cfg);
 
-        // DO NOT use set_disconnected() - it causes deadlock when called from WebSocket error context
-        // Instead, we'll detect disconnection by polling connection_state in IsConnected()
-        // The WebSocket error will naturally transition the connection state to disconnected
+        // Set disconnected callback to detect connection loss
+        // Only set atomic flag here to avoid deadlock - actual reconnect happens in main loop
+        connection_->set_disconnected([this](std::exception_ptr ex) {
+            ESP_LOGW(TAG, "SignalR disconnected callback triggered, auto_reconnect=%d", 
+                     auto_reconnect_enabled_.load(std::memory_order_acquire) ? 1 : 0);
+            if (auto_reconnect_enabled_.load(std::memory_order_acquire)) {
+                needs_reconnect_.store(true, std::memory_order_release);
+                ESP_LOGI(TAG, "SignalR reconnect flag set");
+                if (ex) {
+                    try {
+                        std::rethrow_exception(ex);
+                    } catch (const std::exception& e) {
+                        ESP_LOGW(TAG, "SignalR disconnect reason: %s", e.what());
+                        last_error_ = e.what();
+                    }
+                }
+            }
+        });
 
         initialized_ = true;
         ESP_LOGI(TAG, "SignalR client initialized with URL: %s", hub_url_.c_str());
@@ -128,8 +143,6 @@ bool SignalRClient::Connect() {
             ESP_LOGW(TAG, "SignalR connection initiated, state: %s", GetConnectionState().c_str());
         }
 
-        StartReconnectTask();
-
         return true;
 
     } catch (const std::exception& e) {
@@ -146,11 +159,6 @@ void SignalRClient::Disconnect() {
 
     try {
         ESP_LOGI(TAG, "Disconnecting from SignalR hub...");
-        reconnect_running_.store(false, std::memory_order_release);
-        if (reconnect_task_) {
-            vTaskDelete(reconnect_task_);
-            reconnect_task_ = nullptr;
-        }
         connecting_.store(false, std::memory_order_release);
         // Provide empty callback to satisfy API - do NOTHING inside to avoid deadlock
         connection_->stop([](std::exception_ptr) {
@@ -160,6 +168,76 @@ void SignalRClient::Disconnect() {
     } catch (const std::exception& e) {
         ESP_LOGE(TAG, "Exception during disconnect: %s", e.what());
     }
+}
+
+bool SignalRClient::Reconnect() {
+    if (!initialized_) {
+        ESP_LOGW(TAG, "SignalR client not initialized, cannot reconnect");
+        return false;
+    }
+
+    // If already connected, skip reconnection
+    if (IsConnected()) {
+        ESP_LOGI(TAG, "SignalR already connected, skipping reconnect");
+        return true;
+    }
+
+    // If currently connecting, skip
+    if (connecting_.load(std::memory_order_acquire)) {
+        ESP_LOGW(TAG, "SignalR connection already in progress");
+        return true;
+    }
+
+    ESP_LOGI(TAG, "Attempting SignalR reconnection...");
+    return Connect();
+}
+
+bool SignalRClient::NeedsReconnect() const {
+    return needs_reconnect_.load(std::memory_order_acquire);
+}
+
+void SignalRClient::PerformReconnect() {
+    if (!needs_reconnect_.load(std::memory_order_acquire)) {
+        return;
+    }
+    
+    // Clear the flag first
+    needs_reconnect_.store(false, std::memory_order_release);
+    
+    if (!initialized_) {
+        ESP_LOGW(TAG, "SignalR not initialized, skipping reconnect");
+        return;
+    }
+    
+    if (connecting_.load(std::memory_order_acquire)) {
+        ESP_LOGW(TAG, "SignalR already connecting, skipping reconnect");
+        return;
+    }
+    
+    ESP_LOGI(TAG, "SignalR connection lost, performing full reconnect...");
+    
+    // First stop the current connection to clean up
+    if (connection_) {
+        connection_->stop([](std::exception_ptr) {
+            // Empty callback - just wait for stop to complete
+        });
+        // Give it a moment to stop
+        vTaskDelay(pdMS_TO_TICKS(500));
+    }
+    
+    // Now reconnect
+    Connect();
+}
+
+void SignalRClient::SetAutoReconnectEnabled(bool enabled) {
+    auto_reconnect_enabled_.store(enabled, std::memory_order_release);
+    if (!enabled) {
+        needs_reconnect_.store(false, std::memory_order_release);
+    }
+}
+
+bool SignalRClient::IsInitialized() const {
+    return initialized_;
 }
 
 bool SignalRClient::IsConnected() const {
@@ -336,66 +414,6 @@ std::vector<signalr::value> SignalRClient::ParseJsonArray(const std::string& jso
 
     cJSON_Delete(root);
     return result;
-}
-
-void SignalRClient::StartReconnectTask() {
-    if (reconnect_running_.load(std::memory_order_acquire)) {
-        return;
-    }
-
-    reconnect_running_.store(true, std::memory_order_release);
-    // Stack was overflowing at 4KB; enlarge to 8KB for websocket/start calls
-    if (xTaskCreate(&SignalRClient::ReconnectTaskThunk, "signalr_reconnect", 8192, this,
-                    tskIDLE_PRIORITY + 2, &reconnect_task_) != pdPASS) {
-        ESP_LOGE(TAG, "Failed to create reconnect task");
-        reconnect_running_.store(false, std::memory_order_release);
-        reconnect_task_ = nullptr;
-    }
-}
-
-void SignalRClient::ReconnectTaskThunk(void* param) {
-    auto* self = static_cast<SignalRClient*>(param);
-    const TickType_t retry_delay = pdMS_TO_TICKS(5000);
-    const TickType_t connected_delay = pdMS_TO_TICKS(10000);
-
-    for (;;) {
-        if (!self->reconnect_running_.load(std::memory_order_acquire)) {
-            break;
-        }
-
-        auto state = self->connection_ ? self->connection_->get_connection_state() : signalr::connection_state::disconnected;
-
-        if (state == signalr::connection_state::connected) {
-            vTaskDelay(connected_delay);
-            continue;
-        }
-
-        if (state == signalr::connection_state::connecting || state == signalr::connection_state::disconnecting) {
-            // Let the in-flight transition finish
-            vTaskDelay(pdMS_TO_TICKS(500));
-            continue;
-        }
-
-        // state == disconnected
-        if (!self->connecting_.load(std::memory_order_acquire)) {
-            ESP_LOGW(TAG, "SignalR disconnected; attempting reconnect...");
-            self->connecting_.store(true, std::memory_order_release);
-            self->connection_->start([self](std::exception_ptr ex) {
-                self->connecting_.store(false, std::memory_order_release);
-                if (ex) {
-                    try {
-                        std::rethrow_exception(ex);
-                    } catch (const std::exception& e) {
-                        self->last_error_ = e.what();
-                    }
-                }
-            });
-        }
-
-        vTaskDelay(retry_delay);
-    }
-
-    vTaskDelete(nullptr);
 }
 
 #endif // CONFIG_ENABLE_SIGNALR_CLIENT
