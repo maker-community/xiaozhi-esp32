@@ -9,6 +9,7 @@
 #include "mcp_server.h"
 #include "assets.h"
 #include "settings.h"
+#include "keycloak_auth.h"
 
 #include <cstring>
 #include <esp_log.h>
@@ -329,6 +330,9 @@ void Application::ActivationTask() {
     // Initialize the protocol
     InitializeProtocol();
 
+    // Initialize SignalR client (if enabled)
+    InitializeSignalR();
+
     // Signal completion to main loop
     xEventGroupSetBits(event_group_, MAIN_EVENT_ACTIVATION_DONE);
 }
@@ -603,6 +607,160 @@ void Application::InitializeProtocol() {
     });
     
     protocol_->Start();
+}
+
+void Application::InitializeSignalR() {
+#ifdef CONFIG_ENABLE_SIGNALR_CLIENT
+    // 优先从运行时配置读取，如果为空则使用编译时配置
+    Settings settings("signalr", false);
+    std::string hub_url = settings.GetString("hub_url");
+    
+    if (hub_url.empty()) {
+        // 使用编译时配置的默认值
+#ifdef CONFIG_SIGNALR_HUB_URL
+        hub_url = CONFIG_SIGNALR_HUB_URL;
+#endif
+    }
+    
+    if (hub_url.empty()) {
+        ESP_LOGI(TAG, "SignalR not configured, skipping");
+        return;
+    }
+    
+    ESP_LOGI(TAG, "SignalR Hub URL: %s", hub_url.c_str());
+    
+    // 从 Keycloak 获取 access token
+    Settings keycloak_settings("keycloak", false);
+    std::string server_url = keycloak_settings.GetString("server_url");
+    std::string realm = keycloak_settings.GetString("realm");
+    std::string client_id = keycloak_settings.GetString("client_id");
+    
+    std::string token;
+    if (!server_url.empty() && !realm.empty() && !client_id.empty()) {
+        KeycloakAuth keycloak_auth(server_url, realm, client_id);
+        keycloak_auth.LoadTokens();
+        
+        if (keycloak_auth.IsAuthenticated()) {
+            token = keycloak_auth.GetAccessToken();
+            ESP_LOGI(TAG, "Using Keycloak access token for SignalR authentication");
+        } else {
+            ESP_LOGW(TAG, "Keycloak not authenticated, SignalR will connect without token");
+        }
+    } else {
+        ESP_LOGI(TAG, "Keycloak not configured, SignalR will connect without token");
+    }
+    
+    auto& signalr = SignalRClient::GetInstance();
+    
+    if (!signalr.Initialize(hub_url, token)) {
+        ESP_LOGE(TAG, "Failed to initialize SignalR client");
+        return;
+    }
+    
+    // Register custom message handler
+    signalr.OnCustomMessage([this](const cJSON* payload) {
+        if (!payload) return;
+        
+        char* json_str = cJSON_PrintUnformatted(payload);
+        if (json_str) {
+            Schedule([this, message = std::string(json_str)]() {
+                HandleSignalRMessage(message);
+            });
+            cJSON_free(json_str);
+        }
+    });
+    
+    // Register connection state change handler
+    signalr.OnConnectionStateChanged([this](bool connected, const std::string& error) {
+        Schedule([this, connected, error]() {
+            auto display = Board::GetInstance().GetDisplay();
+            if (connected) {
+                ESP_LOGI(TAG, "SignalR connected");
+                display->ShowNotification("SignalR 已连接", 3000);
+            } else {
+                if (!error.empty()) {
+                    ESP_LOGE(TAG, "SignalR disconnected: %s", error.c_str());
+                } else {
+                    ESP_LOGI(TAG, "SignalR disconnected");
+                }
+            }
+        });
+    });
+    
+    // Connect to SignalR hub
+    if (!signalr.Connect()) {
+        ESP_LOGE(TAG, "Failed to connect to SignalR hub");
+    }
+#else
+    ESP_LOGI(TAG, "SignalR client is disabled");
+#endif
+}
+
+void Application::HandleSignalRMessage(const std::string& message) {
+    ESP_LOGI(TAG, "Handling SignalR message: %s", message.c_str());
+    
+    auto root = cJSON_Parse(message.c_str());
+    if (!root) {
+        ESP_LOGE(TAG, "Failed to parse SignalR message JSON");
+        return;
+    }
+    
+    auto display = Board::GetInstance().GetDisplay();
+    
+    // Check message action/type
+    auto action = cJSON_GetObjectItem(root, "action");
+    if (cJSON_IsString(action)) {
+        if (strcmp(action->valuestring, "notification") == 0) {
+            // Handle notification
+            auto title = cJSON_GetObjectItem(root, "title");
+            auto content = cJSON_GetObjectItem(root, "content");
+            auto emotion = cJSON_GetObjectItem(root, "emotion");
+            
+            const char* title_str = cJSON_IsString(title) ? title->valuestring : Lang::Strings::INFO;
+            const char* content_str = cJSON_IsString(content) ? content->valuestring : "";
+            const char* emotion_str = cJSON_IsString(emotion) ? emotion->valuestring : "bell";
+            
+            Alert(title_str, content_str, emotion_str, Lang::Sounds::OGG_POPUP);
+            
+        } else if (strcmp(action->valuestring, "command") == 0) {
+            // Handle command
+            auto cmd = cJSON_GetObjectItem(root, "command");
+            if (cJSON_IsString(cmd)) {
+                if (strcmp(cmd->valuestring, "reboot") == 0) {
+                    Reboot();
+                } else if (strcmp(cmd->valuestring, "wake") == 0) {
+                    // Trigger wake word detection
+                    xEventGroupSetBits(event_group_, MAIN_EVENT_WAKE_WORD_DETECTED);
+                } else {
+                    ESP_LOGW(TAG, "Unknown SignalR command: %s", cmd->valuestring);
+                }
+            }
+            
+        } else if (strcmp(action->valuestring, "display") == 0) {
+            // Display custom content
+            auto content = cJSON_GetObjectItem(root, "content");
+            if (cJSON_IsString(content)) {
+                display->SetChatMessage("system", content->valuestring);
+            }
+            
+        } else {
+            // Default: display as system message
+            char* display_str = cJSON_Print(root);
+            if (display_str) {
+                display->SetChatMessage("system", display_str);
+                cJSON_free(display_str);
+            }
+        }
+    } else {
+        // No action specified, display raw message
+        char* display_str = cJSON_Print(root);
+        if (display_str) {
+            display->SetChatMessage("system", display_str);
+            cJSON_free(display_str);
+        }
+    }
+    
+    cJSON_Delete(root);
 }
 
 void Application::ShowActivationCode(const std::string& code, const std::string& message) {

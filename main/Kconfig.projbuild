@@ -719,6 +719,31 @@ config RECEIVE_CUSTOM_MESSAGE
     help
         Enable custom message reception, allow the device to receive custom messages from the server (preferably through the MQTT protocol)
 
+config ENABLE_SIGNALR_CLIENT
+    bool "Enable SignalR Client"
+    default n
+    help
+        Enable SignalR client for receiving server-side push notifications and real-time commands.
+        SignalR provides a separate data channel independent of the WebSocket audio stream,
+        ideal for background notifications, remote commands, and bidirectional communication.
+
+config SIGNALR_HUB_URL
+    string "SignalR Hub URL"
+    depends on ENABLE_SIGNALR_CLIENT
+    default ""
+    help
+        SignalR hub endpoint URL (e.g., wss://your-server.com/hub or https://your-server.com/hub)
+        Leave empty to configure at runtime via NVS settings.
+        Authentication token is automatically obtained from Keycloak login.
+
+config SIGNALR_AUTO_RECONNECT
+    bool "Enable SignalR Auto Reconnect"
+    depends on ENABLE_SIGNALR_CLIENT
+    default y
+    help
+        Automatically reconnect to SignalR hub when connection is lost.
+        The SignalR library will handle reconnection with exponential backoff.
+
 menu "Camera Configuration"
     depends on !IDF_TARGET_ESP32
 

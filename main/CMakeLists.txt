@@ -35,6 +35,7 @@ set(SOURCES "audio/audio_codec.cc"
             "settings.cc"
             "device_state_machine.cc"
             "keycloak_auth.cc"
+            "signalr_client.cc"
             "assets.cc"
             "main.cc"
             )
