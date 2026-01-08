@@ -670,22 +670,8 @@ void Application::InitializeSignalR() {
         }
     });
     
-    // Register connection state change handler
-    signalr.OnConnectionStateChanged([this](bool connected, const std::string& error) {
-        Schedule([this, connected, error]() {
-            auto display = Board::GetInstance().GetDisplay();
-            if (connected) {
-                ESP_LOGI(TAG, "SignalR connected");
-                display->ShowNotification("SignalR 已连接", 3000);
-            } else {
-                if (!error.empty()) {
-                    ESP_LOGE(TAG, "SignalR disconnected: %s", error.c_str());
-                } else {
-                    ESP_LOGI(TAG, "SignalR disconnected");
-                }
-            }
-        });
-    });
+    // Note: SignalR disconnection is handled internally via atomic flags
+    // No callback registration needed to avoid deadlock issues
     
     // Connect to SignalR hub
     if (!signalr.Connect()) {

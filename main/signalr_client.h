@@ -4,7 +4,10 @@
 #include <string>
 #include <functional>
 #include <memory>
+#include <atomic>
 #include <cJSON.h>
+#include <freertos/FreeRTOS.h>
+#include <freertos/task.h>
 
 #ifdef CONFIG_ENABLE_SIGNALR_CLIENT
 
@@ -66,8 +69,15 @@ public:
 
     /**
      * Register a handler for connection state changes
+     * Note: Callback should NOT call complex operations like Schedule()
      */
     void OnConnectionStateChanged(std::function<void(bool connected, const std::string& error)> callback);
+
+    /**
+     * Get the last connection error message
+     * Safe to call from any context
+     */
+    std::string GetLastConnectionError() const;
 
     /**
      * Invoke a hub method with arguments
@@ -93,12 +103,21 @@ private:
     std::string hub_url_;
     std::string token_;
     bool initialized_ = false;
+    std::atomic<bool> connection_lost_{false};
+    std::string last_error_;
+    std::atomic<bool> connecting_{false};
+    std::atomic<bool> reconnect_running_{false};
+    TaskHandle_t reconnect_task_{nullptr};
     
     std::function<void(const cJSON*)> on_custom_message_;
     std::function<void(bool, const std::string&)> on_connection_state_changed_;
 
     // Helper to parse JSON array string to signalr::value vector
     std::vector<signalr::value> ParseJsonArray(const std::string& json_str);
+
+    // Background reconnect loop
+    void StartReconnectTask();
+    static void ReconnectTaskThunk(void* param);
 };
 
 #else // !CONFIG_ENABLE_SIGNALR_CLIENT
