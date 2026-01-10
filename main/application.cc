@@ -255,18 +255,15 @@ void Application::Run() {
             }
 
 #ifdef CONFIG_ENABLE_SIGNALR_CLIENT
-            // Check SignalR reconnection every 5 seconds
-            if (clock_ticks_ % 5 == 0) {
+            // Log SignalR connection status every 30 seconds for debugging
+            // NOTE: Auto-reconnection is handled internally by the SignalR library
+            // in a dedicated FreeRTOS task to avoid blocking the main loop
+            if (clock_ticks_ % 30 == 0) {
                 auto& signalr = SignalRClient::GetInstance();
                 if (signalr.IsInitialized()) {
-                    bool needs = signalr.NeedsReconnect();
-                    bool connected = signalr.IsConnected();
-                    if (needs || !connected) {
-                        ESP_LOGI(TAG, "SignalR check: needs_reconnect=%d, connected=%d", needs ? 1 : 0, connected ? 1 : 0);
-                    }
-                    if (needs) {
-                        signalr.PerformReconnect();
-                    }
+                    ESP_LOGD(TAG, "SignalR status: connected=%d, state=%s", 
+                             signalr.IsConnected() ? 1 : 0, 
+                             signalr.GetConnectionState().c_str());
                 }
             }
 #endif
@@ -294,15 +291,15 @@ void Application::HandleNetworkConnectedEvent() {
         }, "activation", 4096 * 2, this, 2, &activation_task_handle_);
     } else {
 #ifdef CONFIG_ENABLE_SIGNALR_CLIENT
-        // Network restored after disconnection, try to reconnect SignalR
+        // Network restored - SignalR's internal auto-reconnect will handle this
+        // Just re-enable the flag so it can attempt reconnection in its own task
         auto& signalr = SignalRClient::GetInstance();
         if (signalr.IsInitialized()) {
-            // Re-enable auto-reconnect now that network is back
             signalr.SetAutoReconnectEnabled(true);
-            if (!signalr.IsConnected()) {
-                ESP_LOGI(TAG, "Network restored, attempting SignalR reconnection");
-                signalr.Reconnect();
-            }
+            ESP_LOGI(TAG, "Network restored, SignalR auto-reconnect enabled (state=%s)", 
+                     signalr.GetConnectionState().c_str());
+            // The library's internal reconnection logic runs in a separate task
+            // and won't block voice call functionality
         }
 #endif
     }

@@ -208,11 +208,18 @@ bool SignalRClient::NeedsReconnect() const {
 }
 
 void SignalRClient::PerformReconnect() {
+    // NOTE: This method is DEPRECATED. The SignalR library handles reconnection
+    // internally in a dedicated FreeRTOS task (see hub_connection_impl.cpp).
+    // This method should NOT be called from the main loop as it can block.
+    // 
+    // If you need to trigger a reconnection, use the library's built-in
+    // auto-reconnect feature by calling SetAutoReconnectEnabled(true).
+    
     if (!needs_reconnect_.load(std::memory_order_acquire)) {
         return;
     }
     
-    // Clear the flag first
+    // Clear the flag - the library's internal reconnect will handle this
     needs_reconnect_.store(false, std::memory_order_release);
     
     if (!initialized_) {
@@ -221,23 +228,18 @@ void SignalRClient::PerformReconnect() {
     }
     
     if (connecting_.load(std::memory_order_acquire)) {
-        ESP_LOGW(TAG, "SignalR already connecting, skipping reconnect");
+        ESP_LOGW(TAG, "SignalR already connecting, internal auto-reconnect will handle");
         return;
     }
     
-    ESP_LOGI(TAG, "SignalR connection lost, performing full reconnect...");
-    
-    // First stop the current connection to clean up
-    if (connection_) {
-        connection_->stop([](std::exception_ptr) {
-            // Empty callback - just wait for stop to complete
-        });
-        // Give it a moment to stop
-        vTaskDelay(pdMS_TO_TICKS(500));
+    // Check if already connected (library may have reconnected automatically)
+    if (IsConnected()) {
+        ESP_LOGI(TAG, "SignalR already connected via internal auto-reconnect");
+        return;
     }
     
-    // Now reconnect
-    Connect();
+    // Log for debugging - the library's internal mechanism handles actual reconnection
+    ESP_LOGD(TAG, "SignalR needs_reconnect flag was set, library auto-reconnect should handle");
 }
 
 void SignalRClient::SetAutoReconnectEnabled(bool enabled) {
