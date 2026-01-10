@@ -65,6 +65,12 @@ bool SignalRClient::Initialize(const std::string& hub_url, const std::string& to
             return std::make_shared<signalr::esp32_http_client>(config);
         });
 
+        // Enable automatic reconnection
+        builder.with_automatic_reconnect();
+
+        // Skip negotiation (direct WebSocket connection)
+        builder.skip_negotiation(true);
+
         // Build connection
         connection_ = std::make_unique<signalr::hub_connection>(builder.build());
 
@@ -73,6 +79,11 @@ bool SignalRClient::Initialize(const std::string& hub_url, const std::string& to
         cfg.set_server_timeout(std::chrono::seconds(60));     // server expects 60s idle before dropping
         cfg.set_keepalive_interval(std::chrono::seconds(15));  // send ping every 15s
         cfg.set_handshake_timeout(std::chrono::seconds(30));   // generous handshake
+        
+        // Configure automatic reconnection
+        cfg.enable_auto_reconnect(true);
+        cfg.set_max_reconnect_attempts(-1);  // Infinite retry attempts
+        
         connection_->set_client_config(cfg);
 
         // Set disconnected callback to detect connection loss
