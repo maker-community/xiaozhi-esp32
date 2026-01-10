@@ -133,6 +133,35 @@ bool SignalRClient::Initialize(const std::string& hub_url, const std::string& to
             }
         });
 
+        // Register handler for "CustomMessage" hub method
+        // NOTE: Must register BEFORE connecting, otherwise handler won't be triggered
+        connection_->on("CustomMessage", [this](const std::vector<signalr::value>& args) {
+            if (args.empty()) {
+                ESP_LOGW(TAG, "Received empty CustomMessage");
+                return;
+            }
+
+            try {
+                // Parse the first argument as JSON string
+                std::string json_str = args[0].as_string();
+                ESP_LOGI(TAG, "📨 Received CustomMessage: %s", json_str.c_str());
+
+                auto root = cJSON_Parse(json_str.c_str());
+                if (root) {
+                    if (on_custom_message_) {
+                        on_custom_message_(root);
+                    } else {
+                        ESP_LOGW(TAG, "CustomMessage callback not set");
+                    }
+                    cJSON_Delete(root);
+                } else {
+                    ESP_LOGE(TAG, "Failed to parse CustomMessage JSON");
+                }
+            } catch (const std::exception& e) {
+                ESP_LOGE(TAG, "Exception handling CustomMessage: %s", e.what());
+            }
+        });
+
         initialized_ = true;
         ESP_LOGI(TAG, "SignalR client initialized with URL: %s", hub_url_.c_str());
         ESP_LOGI(TAG, "Memory after init: internal=%lu, PSRAM=%lu",
@@ -326,37 +355,7 @@ std::string SignalRClient::GetConnectionState() const {
 
 void SignalRClient::OnCustomMessage(std::function<void(const cJSON*)> callback) {
     on_custom_message_ = callback;
-
-    if (!connection_) {
-        ESP_LOGW(TAG, "Cannot register handler: connection not initialized");
-        return;
-    }
-
-    // Register handler for "CustomMessage" hub method
-    connection_->on("CustomMessage", [this](const std::vector<signalr::value>& args) {
-        if (args.empty()) {
-            ESP_LOGW(TAG, "Received empty CustomMessage");
-            return;
-        }
-
-        try {
-            // Parse the first argument as JSON string
-            std::string json_str = args[0].as_string();
-            ESP_LOGI(TAG, "Received CustomMessage: %s", json_str.c_str());
-
-            auto root = cJSON_Parse(json_str.c_str());
-            if (root) {
-                if (on_custom_message_) {
-                    on_custom_message_(root);
-                }
-                cJSON_Delete(root);
-            } else {
-                ESP_LOGE(TAG, "Failed to parse CustomMessage JSON");
-            }
-        } catch (const std::exception& e) {
-            ESP_LOGE(TAG, "Exception handling CustomMessage: %s", e.what());
-        }
-    });
+    ESP_LOGI(TAG, "CustomMessage callback registered");
 }
 
 void SignalRClient::OnConnectionStateChanged(

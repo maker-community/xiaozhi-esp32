@@ -164,6 +164,8 @@ private:
     void InitializeProtocol();
     void InitializeSignalR();
     void HandleSignalRMessage(const std::string& message);
+    void HandleSignalRImageMessage(const char* url);
+    void HandleSignalRAudioMessage(const char* url);
     void ShowActivationCode(const std::string& code, const std::string& message);
     void SetListeningMode(ListeningMode mode);
     

@@ -11,6 +11,11 @@
 #include "settings.h"
 #include "keycloak_auth.h"
 
+#ifdef HAVE_LVGL
+#include "lcd_display.h"
+#include "lvgl_display.h"
+#endif
+
 #include <cstring>
 #include <esp_log.h>
 #include <cJSON.h>
@@ -748,18 +753,38 @@ void Application::HandleSignalRMessage(const std::string& message) {
     if (cJSON_IsString(action)) {
         if (strcmp(action->valuestring, "notification") == 0) {
             // Handle notification
+            // JSON: {"action":"notification", "title":"标题", "content":"内容", "emotion":"bell", "sound":"popup"}
             auto title = cJSON_GetObjectItem(root, "title");
             auto content = cJSON_GetObjectItem(root, "content");
             auto emotion = cJSON_GetObjectItem(root, "emotion");
+            auto sound = cJSON_GetObjectItem(root, "sound");
             
             const char* title_str = cJSON_IsString(title) ? title->valuestring : Lang::Strings::INFO;
             const char* content_str = cJSON_IsString(content) ? content->valuestring : "";
             const char* emotion_str = cJSON_IsString(emotion) ? emotion->valuestring : "bell";
             
-            Alert(title_str, content_str, emotion_str, Lang::Sounds::OGG_POPUP);
+            // Select sound based on "sound" field
+            std::string_view sound_view = Lang::Sounds::OGG_POPUP;
+            if (cJSON_IsString(sound)) {
+                if (strcmp(sound->valuestring, "success") == 0) {
+                    sound_view = Lang::Sounds::OGG_SUCCESS;
+                } else if (strcmp(sound->valuestring, "vibration") == 0) {
+                    sound_view = Lang::Sounds::OGG_VIBRATION;
+                } else if (strcmp(sound->valuestring, "exclamation") == 0) {
+                    sound_view = Lang::Sounds::OGG_EXCLAMATION;
+                } else if (strcmp(sound->valuestring, "low_battery") == 0) {
+                    sound_view = Lang::Sounds::OGG_LOW_BATTERY;
+                } else if (strcmp(sound->valuestring, "none") == 0) {
+                    sound_view = "";
+                }
+                // default: popup
+            }
+            
+            Alert(title_str, content_str, emotion_str, sound_view);
             
         } else if (strcmp(action->valuestring, "command") == 0) {
             // Handle command
+            // JSON: {"action":"command", "command":"reboot|wake|listen|stop"}
             auto cmd = cJSON_GetObjectItem(root, "command");
             if (cJSON_IsString(cmd)) {
                 if (strcmp(cmd->valuestring, "reboot") == 0) {
@@ -767,6 +792,10 @@ void Application::HandleSignalRMessage(const std::string& message) {
                 } else if (strcmp(cmd->valuestring, "wake") == 0) {
                     // Trigger wake word detection
                     xEventGroupSetBits(event_group_, MAIN_EVENT_WAKE_WORD_DETECTED);
+                } else if (strcmp(cmd->valuestring, "listen") == 0) {
+                    StartListening();
+                } else if (strcmp(cmd->valuestring, "stop") == 0) {
+                    StopListening();
                 } else {
                     ESP_LOGW(TAG, "Unknown SignalR command: %s", cmd->valuestring);
                 }
@@ -774,10 +803,60 @@ void Application::HandleSignalRMessage(const std::string& message) {
             
         } else if (strcmp(action->valuestring, "display") == 0) {
             // Display custom content
+            // JSON: {"action":"display", "content":"文本内容", "role":"system"}
             auto content = cJSON_GetObjectItem(root, "content");
+            auto role = cJSON_GetObjectItem(root, "role");
+            const char* role_str = cJSON_IsString(role) ? role->valuestring : "system";
             if (cJSON_IsString(content)) {
-                display->SetChatMessage("system", content->valuestring);
+                display->SetChatMessage(role_str, content->valuestring);
             }
+            
+        } else if (strcmp(action->valuestring, "emotion") == 0) {
+            // Change emotion/expression
+            // JSON: {"action":"emotion", "emotion":"happy"}
+            auto emotion = cJSON_GetObjectItem(root, "emotion");
+            if (cJSON_IsString(emotion)) {
+                display->SetEmotion(emotion->valuestring);
+            }
+            
+        } else if (strcmp(action->valuestring, "image") == 0) {
+            // Display image from URL
+            // JSON: {"action":"image", "url":"https://example.com/image.jpg"}
+            auto url = cJSON_GetObjectItem(root, "url");
+            if (cJSON_IsString(url)) {
+                HandleSignalRImageMessage(url->valuestring);
+            } else {
+                ESP_LOGW(TAG, "Image action requires 'url' field");
+            }
+            
+        } else if (strcmp(action->valuestring, "audio") == 0) {
+            // Play audio from URL (OGG format)
+            // JSON: {"action":"audio", "url":"https://example.com/sound.ogg"}
+            auto url = cJSON_GetObjectItem(root, "url");
+            if (cJSON_IsString(url)) {
+                HandleSignalRAudioMessage(url->valuestring);
+            } else {
+                ESP_LOGW(TAG, "Audio action requires 'url' field");
+            }
+            
+        } else if (strcmp(action->valuestring, "qrcode") == 0) {
+            // Show QR code
+            // JSON: {"action":"qrcode", "data":"https://...", "title":"标题", "subtitle":"副标题"}
+            auto data = cJSON_GetObjectItem(root, "data");
+            auto title = cJSON_GetObjectItem(root, "title");
+            auto subtitle = cJSON_GetObjectItem(root, "subtitle");
+            if (cJSON_IsString(data)) {
+                const char* title_str = cJSON_IsString(title) ? title->valuestring : nullptr;
+                const char* subtitle_str = cJSON_IsString(subtitle) ? subtitle->valuestring : nullptr;
+                display->ShowQRCode(data->valuestring, title_str, subtitle_str);
+            } else {
+                ESP_LOGW(TAG, "QRCode action requires 'data' field");
+            }
+            
+        } else if (strcmp(action->valuestring, "hide_qrcode") == 0) {
+            // Hide QR code
+            // JSON: {"action":"hide_qrcode"}
+            display->HideQRCode();
             
         } else {
             // Default: display as system message
@@ -797,6 +876,131 @@ void Application::HandleSignalRMessage(const std::string& message) {
     }
     
     cJSON_Delete(root);
+}
+
+void Application::HandleSignalRImageMessage(const char* url) {
+#ifdef HAVE_LVGL
+    ESP_LOGI(TAG, "Downloading image from: %s", url);
+    
+    auto http = Board::GetInstance().GetNetwork()->CreateHttp(10);
+    if (!http) {
+        ESP_LOGE(TAG, "Failed to create HTTP client");
+        return;
+    }
+    
+    if (!http->Open("GET", url)) {
+        ESP_LOGE(TAG, "Failed to open URL: %s", url);
+        return;
+    }
+    
+    int status_code = http->GetStatusCode();
+    if (status_code != 200) {
+        ESP_LOGE(TAG, "HTTP error: %d", status_code);
+        http->Close();
+        return;
+    }
+    
+    size_t content_length = http->GetBodyLength();
+    if (content_length == 0 || content_length > 1024 * 1024) { // Max 1MB
+        ESP_LOGE(TAG, "Invalid content length: %d", content_length);
+        http->Close();
+        return;
+    }
+    
+    // Allocate memory for image data
+    char* data = (char*)heap_caps_malloc(content_length, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+    if (data == nullptr) {
+        // Try internal memory if PSRAM not available
+        data = (char*)heap_caps_malloc(content_length, MALLOC_CAP_8BIT);
+    }
+    if (data == nullptr) {
+        ESP_LOGE(TAG, "Failed to allocate memory for image: %d bytes", content_length);
+        http->Close();
+        return;
+    }
+    
+    // Download image data
+    size_t total_read = 0;
+    while (total_read < content_length) {
+        int ret = http->Read(data + total_read, content_length - total_read);
+        if (ret < 0) {
+            ESP_LOGE(TAG, "Failed to read image data");
+            heap_caps_free(data);
+            http->Close();
+            return;
+        }
+        if (ret == 0) {
+            break;
+        }
+        total_read += ret;
+    }
+    http->Close();
+    
+    ESP_LOGI(TAG, "Image downloaded: %d bytes", total_read);
+    
+    // Create image and display
+    auto display = Board::GetInstance().GetDisplay();
+    auto lcd_display = static_cast<LcdDisplay*>(display);
+    auto image = std::make_unique<LvglAllocatedImage>(data, total_read);
+    lcd_display->SetPreviewImage(std::move(image));
+#else
+    ESP_LOGW(TAG, "Image display not supported (LVGL disabled)");
+#endif
+}
+
+void Application::HandleSignalRAudioMessage(const char* url) {
+    ESP_LOGI(TAG, "Downloading audio from: %s", url);
+    
+    auto http = Board::GetInstance().GetNetwork()->CreateHttp(10);
+    if (!http) {
+        ESP_LOGE(TAG, "Failed to create HTTP client");
+        return;
+    }
+    
+    if (!http->Open("GET", url)) {
+        ESP_LOGE(TAG, "Failed to open URL: %s", url);
+        return;
+    }
+    
+    int status_code = http->GetStatusCode();
+    if (status_code != 200) {
+        ESP_LOGE(TAG, "HTTP error: %d", status_code);
+        http->Close();
+        return;
+    }
+    
+    size_t content_length = http->GetBodyLength();
+    if (content_length == 0 || content_length > 512 * 1024) { // Max 512KB for audio
+        ESP_LOGE(TAG, "Invalid audio content length: %d", content_length);
+        http->Close();
+        return;
+    }
+    
+    // Read audio data into string
+    std::string audio_data;
+    audio_data.reserve(content_length);
+    
+    char buffer[1024];
+    size_t total_read = 0;
+    while (total_read < content_length) {
+        int ret = http->Read(buffer, std::min(sizeof(buffer), content_length - total_read));
+        if (ret < 0) {
+            ESP_LOGE(TAG, "Failed to read audio data");
+            http->Close();
+            return;
+        }
+        if (ret == 0) {
+            break;
+        }
+        audio_data.append(buffer, ret);
+        total_read += ret;
+    }
+    http->Close();
+    
+    ESP_LOGI(TAG, "Audio downloaded: %d bytes", total_read);
+    
+    // Play the audio (OGG format)
+    audio_service_.PlaySound(std::string_view(audio_data.data(), audio_data.size()));
 }
 
 void Application::ShowActivationCode(const std::string& code, const std::string& message) {
