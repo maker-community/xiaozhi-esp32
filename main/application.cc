@@ -255,9 +255,22 @@ void Application::Run() {
             }
 
 #ifdef CONFIG_ENABLE_SIGNALR_CLIENT
+            // Check if SignalR needs reconnection (application-layer reconnect)
+            // IMPORTANT: Only reconnect when device is IDLE to avoid blocking audio processing!
+            // PerformReconnect() is a blocking call that can take several seconds.
+            {
+                auto& signalr = SignalRClient::GetInstance();
+                if (signalr.IsInitialized() && signalr.NeedsReconnect()) {
+                    // Only attempt reconnection when device is idle
+                    auto state = GetDeviceState();
+                    if (state == kDeviceStateIdle) {
+                        signalr.PerformReconnect();
+                    }
+                    // If not idle, the reconnect will be attempted on next loop when device becomes idle
+                }
+            }
+            
             // Log SignalR connection status every 30 seconds for debugging
-            // NOTE: Auto-reconnection is handled internally by the SignalR library
-            // in a dedicated FreeRTOS task to avoid blocking the main loop
             if (clock_ticks_ % 30 == 0) {
                 auto& signalr = SignalRClient::GetInstance();
                 if (signalr.IsInitialized()) {

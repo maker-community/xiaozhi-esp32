@@ -66,8 +66,8 @@ bool SignalRClient::Initialize(const std::string& hub_url, const std::string& to
             return std::make_shared<signalr::esp32_http_client>(config);
         });
 
-        // Enable automatic reconnection
-        builder.with_automatic_reconnect();
+        // NOTE: Do NOT use builder.with_automatic_reconnect() - it has race condition bugs!
+        // We use application-layer reconnection via needs_reconnect_ flag instead.
 
         // Skip negotiation (direct WebSocket connection)
         builder.skip_negotiation(true);
@@ -81,16 +81,15 @@ bool SignalRClient::Initialize(const std::string& hub_url, const std::string& to
                  (unsigned long)heap_caps_get_free_size(MALLOC_CAP_SPIRAM));
 
         // Tune timeouts to reduce false disconnects
-        // NOTE: Do NOT call enable_auto_reconnect() here - it's already set via builder.with_automatic_reconnect()
-        // Calling it twice can cause multiple scheduler instances to be created, consuming ~40KB extra RAM!
         signalr::signalr_client_config cfg;
         cfg.set_server_timeout(std::chrono::seconds(60));     // server expects 60s idle before dropping
         cfg.set_keepalive_interval(std::chrono::seconds(15));  // send ping every 15s
         cfg.set_handshake_timeout(std::chrono::seconds(30));   // generous handshake
         
-        // IMPORTANT: Only set timeout parameters, auto-reconnect is already enabled by builder
-        // cfg.enable_auto_reconnect(true);    // REMOVED - duplicate causes memory leak!
-        // cfg.set_max_reconnect_attempts(-1); // REMOVED - handled by builder
+        // IMPORTANT: Disable library's auto-reconnect! It has race condition bugs that cause crashes.
+        // We use our own application-layer reconnection logic via needs_reconnect_ flag instead.
+        // The app layer reconnect is more stable and gives us better control over timing.
+        cfg.enable_auto_reconnect(false);
         
         connection_->set_client_config(cfg);
 
@@ -246,18 +245,15 @@ bool SignalRClient::NeedsReconnect() const {
 }
 
 void SignalRClient::PerformReconnect() {
-    // NOTE: This method is DEPRECATED. The SignalR library handles reconnection
-    // internally in a dedicated FreeRTOS task (see hub_connection_impl.cpp).
-    // This method should NOT be called from the main loop as it can block.
-    // 
-    // If you need to trigger a reconnection, use the library's built-in
-    // auto-reconnect feature by calling SetAutoReconnectEnabled(true).
+    // Application-layer reconnection logic.
+    // This is called from the main application loop when NeedsReconnect() returns true.
+    // IMPORTANT: This method blocks! Only call when device is idle to avoid audio issues.
     
     if (!needs_reconnect_.load(std::memory_order_acquire)) {
         return;
     }
     
-    // Clear the flag - the library's internal reconnect will handle this
+    // Clear the flag first to prevent multiple reconnect attempts
     needs_reconnect_.store(false, std::memory_order_release);
     
     if (!initialized_) {
@@ -266,18 +262,31 @@ void SignalRClient::PerformReconnect() {
     }
     
     if (connecting_.load(std::memory_order_acquire)) {
-        ESP_LOGW(TAG, "SignalR already connecting, internal auto-reconnect will handle");
+        ESP_LOGW(TAG, "SignalR already connecting, skipping");
         return;
     }
     
-    // Check if already connected (library may have reconnected automatically)
+    // Check if already connected
     if (IsConnected()) {
-        ESP_LOGI(TAG, "SignalR already connected via internal auto-reconnect");
+        ESP_LOGI(TAG, "SignalR already connected, skipping reconnect");
         return;
     }
     
-    // Log for debugging - the library's internal mechanism handles actual reconnection
-    ESP_LOGD(TAG, "SignalR needs_reconnect flag was set, library auto-reconnect should handle");
+    // Perform the actual reconnection
+    ESP_LOGI(TAG, "SignalR performing application-layer reconnection (device is idle)...");
+    
+    // Short delay before reconnecting - just enough to avoid rapid retries
+    // Reduced from 2000ms to 500ms since we only reconnect when idle
+    vTaskDelay(pdMS_TO_TICKS(500));
+    
+    // Attempt to connect
+    if (!Connect()) {
+        ESP_LOGW(TAG, "SignalR reconnection failed, will retry when idle again");
+        // Set the flag again so we retry on next poll when device is idle
+        needs_reconnect_.store(true, std::memory_order_release);
+    } else {
+        ESP_LOGI(TAG, "SignalR reconnection initiated successfully");
+    }
 }
 
 void SignalRClient::SetAutoReconnectEnabled(bool enabled) {
