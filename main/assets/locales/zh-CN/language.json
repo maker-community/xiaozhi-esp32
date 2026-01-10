@@ -50,6 +50,15 @@
         "LOADING_ASSETS": "加载资源...",
         "PLEASE_WAIT": "请稍候...",
         "FOUND_NEW_ASSETS": "发现新资源: %s",
-        "HELLO_MY_FRIEND": "你好，我的朋友！"
+        "HELLO_MY_FRIEND": "你好，我的朋友！",
+        "LOGIN_ERROR": "登录错误",
+        "LOGIN_ERROR_START_FAILED": "启动登录失败",
+        "LOGIN_ERROR_AUTH_FAILED": "认证失败",
+        "LOGIN_USER_CODE": "用户代码：%s",
+        "LOGIN_QR_TITLE": "扫码登录",
+        "LOGIN_TIMEOUT": "登录超时",
+        "LOGIN_TIMEOUT_MESSAGE": "用户未在规定时间内完成认证",
+        "LOGIN_SUCCESS": "登录成功",
+        "LOGIN_SUCCESS_MESSAGE": "认证完成"
     }
 }

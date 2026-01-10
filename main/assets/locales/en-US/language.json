@@ -51,6 +51,15 @@
         "FOUND_NEW_ASSETS": "Found new assets: %s",
         "DOWNLOAD_ASSETS_FAILED": "Failed to download assets",
         "LOADING_ASSETS": "Loading assets...",
-        "HELLO_MY_FRIEND": "Hello, my friend!"
+        "HELLO_MY_FRIEND": "Hello, my friend!",
+        "LOGIN_ERROR": "Login Error",
+        "LOGIN_ERROR_START_FAILED": "Failed to start login",
+        "LOGIN_ERROR_AUTH_FAILED": "Authentication failed",
+        "LOGIN_USER_CODE": "User code: %s",
+        "LOGIN_QR_TITLE": "Scan to Login",
+        "LOGIN_TIMEOUT": "Login Timeout",
+        "LOGIN_TIMEOUT_MESSAGE": "User did not complete authentication in time",
+        "LOGIN_SUCCESS": "Login Success",
+        "LOGIN_SUCCESS_MESSAGE": "Authentication completed"
     }
 }
