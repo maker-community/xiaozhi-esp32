@@ -14,6 +14,9 @@
 #ifdef HAVE_LVGL
 #include "lcd_display.h"
 #include "lvgl_display.h"
+#ifndef CONFIG_IDF_TARGET_ESP32
+#include "jpg/jpeg_to_image.h"
+#endif
 #endif
 
 #include <cstring>
@@ -882,67 +885,170 @@ void Application::HandleSignalRImageMessage(const char* url) {
 #ifdef HAVE_LVGL
     ESP_LOGI(TAG, "Downloading image from: %s", url);
     
-    auto http = Board::GetInstance().GetNetwork()->CreateHttp(10);
-    if (!http) {
-        ESP_LOGE(TAG, "Failed to create HTTP client");
-        return;
-    }
+    std::string current_url = url;
+    int max_redirects = 5;
+    int redirect_count = 0;
     
-    if (!http->Open("GET", url)) {
-        ESP_LOGE(TAG, "Failed to open URL: %s", url);
-        return;
-    }
-    
-    int status_code = http->GetStatusCode();
-    if (status_code != 200) {
-        ESP_LOGE(TAG, "HTTP error: %d", status_code);
-        http->Close();
-        return;
-    }
-    
-    size_t content_length = http->GetBodyLength();
-    if (content_length == 0 || content_length > 1024 * 1024) { // Max 1MB
-        ESP_LOGE(TAG, "Invalid content length: %d", content_length);
-        http->Close();
-        return;
-    }
-    
-    // Allocate memory for image data
-    char* data = (char*)heap_caps_malloc(content_length, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
-    if (data == nullptr) {
-        // Try internal memory if PSRAM not available
-        data = (char*)heap_caps_malloc(content_length, MALLOC_CAP_8BIT);
-    }
-    if (data == nullptr) {
-        ESP_LOGE(TAG, "Failed to allocate memory for image: %d bytes", content_length);
-        http->Close();
-        return;
-    }
-    
-    // Download image data
-    size_t total_read = 0;
-    while (total_read < content_length) {
-        int ret = http->Read(data + total_read, content_length - total_read);
-        if (ret < 0) {
-            ESP_LOGE(TAG, "Failed to read image data");
-            heap_caps_free(data);
+    while (redirect_count < max_redirects) {
+        // Use longer timeout (30 seconds) for image downloads
+        auto http = Board::GetInstance().GetNetwork()->CreateHttp(30);
+        if (!http) {
+            ESP_LOGE(TAG, "Failed to create HTTP client");
+            return;
+        }
+        
+        // Tell server we only accept JPEG/PNG (avoid WebP which we can't decode)
+        http->SetHeader("Accept", "image/jpeg, image/png, image/*;q=0.9");
+        
+        if (!http->Open("GET", current_url)) {
+            ESP_LOGE(TAG, "Failed to open URL: %s", current_url.c_str());
+            return;
+        }
+        
+        int status_code = http->GetStatusCode();
+        
+        // Handle redirects (301, 302, 303, 307, 308)
+        if (status_code >= 300 && status_code < 400) {
+            std::string location = http->GetResponseHeader("Location");
+            http->Close();
+            
+            if (location.empty()) {
+                ESP_LOGE(TAG, "Redirect response missing Location header");
+                return;
+            }
+            
+            // Handle relative URLs
+            if (location[0] == '/') {
+                size_t pos = current_url.find("://");
+                if (pos != std::string::npos) {
+                    pos = current_url.find('/', pos + 3);
+                    if (pos != std::string::npos) {
+                        location = current_url.substr(0, pos) + location;
+                    }
+                }
+            }
+            
+            ESP_LOGI(TAG, "Following redirect (%d) to: %s", status_code, location.c_str());
+            current_url = location;
+            redirect_count++;
+            continue;
+        }
+        
+        if (status_code != 200) {
+            ESP_LOGE(TAG, "HTTP error: %d", status_code);
             http->Close();
             return;
         }
-        if (ret == 0) {
-            break;
+        
+        size_t content_length = http->GetBodyLength();
+        const size_t max_image_size = 2 * 1024 * 1024; // Max 2MB (need enough PSRAM for decoding)
+        if (content_length == 0) {
+            ESP_LOGE(TAG, "Empty response (content_length=0)");
+            http->Close();
+            return;
         }
-        total_read += ret;
+        if (content_length > max_image_size) {
+            ESP_LOGE(TAG, "Image too large: %d bytes (max %d bytes). Please compress the image.", 
+                     content_length, max_image_size);
+            http->Close();
+            return;
+        }
+        
+        // Allocate memory for image data
+        uint8_t* data = (uint8_t*)heap_caps_malloc(content_length, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+        if (data == nullptr) {
+            data = (uint8_t*)heap_caps_malloc(content_length, MALLOC_CAP_8BIT);
+        }
+        if (data == nullptr) {
+            ESP_LOGE(TAG, "Failed to allocate memory for image: %d bytes", content_length);
+            http->Close();
+            return;
+        }
+        
+        // Download image data
+        size_t total_read = 0;
+        while (total_read < content_length) {
+            int ret = http->Read((char*)data + total_read, content_length - total_read);
+            if (ret < 0) {
+                ESP_LOGE(TAG, "Failed to read image data");
+                heap_caps_free(data);
+                http->Close();
+                return;
+            }
+            if (ret == 0) {
+                break;
+            }
+            total_read += ret;
+        }
+        http->Close();
+        
+        ESP_LOGI(TAG, "Image downloaded: %d bytes", total_read);
+        
+        // Check image format by magic bytes
+        bool is_jpeg = (total_read >= 2 && data[0] == 0xFF && data[1] == 0xD8);
+        bool is_png = (total_read >= 8 && data[0] == 0x89 && data[1] == 0x50 && data[2] == 0x4E && data[3] == 0x47);
+        bool is_webp = (total_read >= 12 && data[0] == 0x52 && data[1] == 0x49 && data[2] == 0x46 && data[3] == 0x46 
+                        && data[8] == 0x57 && data[9] == 0x45 && data[10] == 0x42 && data[11] == 0x50); // RIFF....WEBP
+        
+        const char* format = is_jpeg ? "JPEG" : (is_png ? "PNG" : (is_webp ? "WebP" : "unknown"));
+        ESP_LOGI(TAG, "Image format: %s", format);
+        
+        // WebP is not supported
+        if (is_webp) {
+            ESP_LOGE(TAG, "WebP format is not supported. Please use JPEG or PNG images.");
+            heap_caps_free(data);
+            return;
+        }
+        
+        auto display = Board::GetInstance().GetDisplay();
+        auto lcd_display = static_cast<LcdDisplay*>(display);
+        
+#ifndef CONFIG_IDF_TARGET_ESP32
+        if (is_jpeg) {
+            // Try to decode JPEG to RGB565 using ESP decoder
+            uint8_t* decoded_data = nullptr;
+            size_t decoded_len = 0;
+            size_t width = 0, height = 0, stride = 0;
+            
+            esp_err_t ret = jpeg_to_image(data, total_read, &decoded_data, &decoded_len, &width, &height, &stride);
+            
+            if (ret == ESP_OK && decoded_data != nullptr) {
+                heap_caps_free(data); // Free original JPEG data
+                ESP_LOGI(TAG, "JPEG decoded: %dx%d", width, height);
+                auto image = std::make_unique<LvglAllocatedImage>(decoded_data, decoded_len, width, height, stride, LV_COLOR_FORMAT_RGB565);
+                lcd_display->SetPreviewImage(std::move(image));
+                return;
+            }
+            
+            // ESP decoder failed - do NOT fallback to LVGL decoder as it doesn't support raw JPEG
+            ESP_LOGE(TAG, "JPEG decoding failed (%s), cannot display image", esp_err_to_name(ret));
+            if (decoded_data) heap_caps_free(decoded_data);
+            heap_caps_free(data);
+            return;
+        }
+#else
+        // On ESP32, we don't have hardware JPEG decoder
+        if (is_jpeg) {
+            ESP_LOGE(TAG, "JPEG images not supported on ESP32 (no hardware decoder)");
+            heap_caps_free(data);
+            return;
+        }
+#endif
+        // Try to use LVGL's built-in image decoder for non-JPEG formats (PNG, etc.)
+        try {
+            ESP_LOGI(TAG, "Creating LvglAllocatedImage for non-JPEG image (%d bytes)...", total_read);
+            auto image = std::make_unique<LvglAllocatedImage>(data, total_read);
+            ESP_LOGI(TAG, "LvglAllocatedImage created, calling SetPreviewImage...");
+            lcd_display->SetPreviewImage(std::move(image));
+            ESP_LOGI(TAG, "SetPreviewImage completed");
+        } catch (const std::exception& e) {
+            ESP_LOGE(TAG, "Failed to create image: %s", e.what());
+            heap_caps_free(data);
+        }
+        return;
     }
-    http->Close();
     
-    ESP_LOGI(TAG, "Image downloaded: %d bytes", total_read);
-    
-    // Create image and display
-    auto display = Board::GetInstance().GetDisplay();
-    auto lcd_display = static_cast<LcdDisplay*>(display);
-    auto image = std::make_unique<LvglAllocatedImage>(data, total_read);
-    lcd_display->SetPreviewImage(std::move(image));
+    ESP_LOGE(TAG, "Too many redirects");
 #else
     ESP_LOGW(TAG, "Image display not supported (LVGL disabled)");
 #endif
@@ -951,56 +1057,94 @@ void Application::HandleSignalRImageMessage(const char* url) {
 void Application::HandleSignalRAudioMessage(const char* url) {
     ESP_LOGI(TAG, "Downloading audio from: %s", url);
     
-    auto http = Board::GetInstance().GetNetwork()->CreateHttp(10);
-    if (!http) {
-        ESP_LOGE(TAG, "Failed to create HTTP client");
-        return;
-    }
+    std::string current_url = url;
+    int max_redirects = 5;
+    int redirect_count = 0;
     
-    if (!http->Open("GET", url)) {
-        ESP_LOGE(TAG, "Failed to open URL: %s", url);
-        return;
-    }
-    
-    int status_code = http->GetStatusCode();
-    if (status_code != 200) {
-        ESP_LOGE(TAG, "HTTP error: %d", status_code);
-        http->Close();
-        return;
-    }
-    
-    size_t content_length = http->GetBodyLength();
-    if (content_length == 0 || content_length > 512 * 1024) { // Max 512KB for audio
-        ESP_LOGE(TAG, "Invalid audio content length: %d", content_length);
-        http->Close();
-        return;
-    }
-    
-    // Read audio data into string
-    std::string audio_data;
-    audio_data.reserve(content_length);
-    
-    char buffer[1024];
-    size_t total_read = 0;
-    while (total_read < content_length) {
-        int ret = http->Read(buffer, std::min(sizeof(buffer), content_length - total_read));
-        if (ret < 0) {
-            ESP_LOGE(TAG, "Failed to read audio data");
+    while (redirect_count < max_redirects) {
+        // Use longer timeout (30 seconds) for audio downloads
+        auto http = Board::GetInstance().GetNetwork()->CreateHttp(30);
+        if (!http) {
+            ESP_LOGE(TAG, "Failed to create HTTP client");
+            return;
+        }
+        
+        if (!http->Open("GET", current_url)) {
+            ESP_LOGE(TAG, "Failed to open URL: %s", current_url.c_str());
+            return;
+        }
+        
+        int status_code = http->GetStatusCode();
+        
+        // Handle redirects (301, 302, 303, 307, 308)
+        if (status_code >= 300 && status_code < 400) {
+            std::string location = http->GetResponseHeader("Location");
+            http->Close();
+            
+            if (location.empty()) {
+                ESP_LOGE(TAG, "Redirect response missing Location header");
+                return;
+            }
+            
+            // Handle relative URLs
+            if (location[0] == '/') {
+                size_t pos = current_url.find("://");
+                if (pos != std::string::npos) {
+                    pos = current_url.find('/', pos + 3);
+                    if (pos != std::string::npos) {
+                        location = current_url.substr(0, pos) + location;
+                    }
+                }
+            }
+            
+            ESP_LOGI(TAG, "Following redirect (%d) to: %s", status_code, location.c_str());
+            current_url = location;
+            redirect_count++;
+            continue;
+        }
+        
+        if (status_code != 200) {
+            ESP_LOGE(TAG, "HTTP error: %d", status_code);
             http->Close();
             return;
         }
-        if (ret == 0) {
-            break;
+        
+        size_t content_length = http->GetBodyLength();
+        if (content_length == 0 || content_length > 512 * 1024) { // Max 512KB for audio
+            ESP_LOGE(TAG, "Invalid audio content length: %d", content_length);
+            http->Close();
+            return;
         }
-        audio_data.append(buffer, ret);
-        total_read += ret;
+        
+        // Read audio data into string
+        std::string audio_data;
+        audio_data.reserve(content_length);
+        
+        char buffer[1024];
+        size_t total_read = 0;
+        while (total_read < content_length) {
+            int ret = http->Read(buffer, std::min(sizeof(buffer), content_length - total_read));
+            if (ret < 0) {
+                ESP_LOGE(TAG, "Failed to read audio data");
+                http->Close();
+                return;
+            }
+            if (ret == 0) {
+                break;
+            }
+            audio_data.append(buffer, ret);
+            total_read += ret;
+        }
+        http->Close();
+        
+        ESP_LOGI(TAG, "Audio downloaded: %d bytes", total_read);
+        
+        // Play the audio (OGG format)
+        audio_service_.PlaySound(std::string_view(audio_data.data(), audio_data.size()));
+        return;
     }
-    http->Close();
     
-    ESP_LOGI(TAG, "Audio downloaded: %d bytes", total_read);
-    
-    // Play the audio (OGG format)
-    audio_service_.PlaySound(std::string_view(audio_data.data(), audio_data.size()));
+    ESP_LOGE(TAG, "Too many redirects");
 }
 
 void Application::ShowActivationCode(const std::string& code, const std::string& message) {
