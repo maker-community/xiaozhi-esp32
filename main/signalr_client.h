@@ -131,6 +131,7 @@ private:
     std::string hub_url_;
     std::string token_;
     bool initialized_ = false;
+    bool connection_confirmed_ = false;  // Set true when server sends Notification
     std::atomic<bool> connection_lost_{false};
     std::atomic<bool> needs_reconnect_{false};
     std::atomic<bool> auto_reconnect_enabled_{true};

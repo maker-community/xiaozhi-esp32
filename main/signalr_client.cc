@@ -3,6 +3,7 @@
 #ifdef CONFIG_ENABLE_SIGNALR_CLIENT
 
 #include <esp_log.h>
+#include <esp_heap_caps.h>
 #include <freertos/FreeRTOS.h>
 #include <freertos/task.h>
 #include <chrono>
@@ -74,15 +75,22 @@ bool SignalRClient::Initialize(const std::string& hub_url, const std::string& to
         // Build connection
         connection_ = std::make_unique<signalr::hub_connection>(builder.build());
 
+        // Log memory status before configuration
+        ESP_LOGI(TAG, "Free heap after connection build: internal=%lu, PSRAM=%lu",
+                 (unsigned long)heap_caps_get_free_size(MALLOC_CAP_INTERNAL),
+                 (unsigned long)heap_caps_get_free_size(MALLOC_CAP_SPIRAM));
+
         // Tune timeouts to reduce false disconnects
+        // NOTE: Do NOT call enable_auto_reconnect() here - it's already set via builder.with_automatic_reconnect()
+        // Calling it twice can cause multiple scheduler instances to be created, consuming ~40KB extra RAM!
         signalr::signalr_client_config cfg;
         cfg.set_server_timeout(std::chrono::seconds(60));     // server expects 60s idle before dropping
         cfg.set_keepalive_interval(std::chrono::seconds(15));  // send ping every 15s
         cfg.set_handshake_timeout(std::chrono::seconds(30));   // generous handshake
         
-        // Configure automatic reconnection
-        cfg.enable_auto_reconnect(true);
-        cfg.set_max_reconnect_attempts(-1);  // Infinite retry attempts
+        // IMPORTANT: Only set timeout parameters, auto-reconnect is already enabled by builder
+        // cfg.enable_auto_reconnect(true);    // REMOVED - duplicate causes memory leak!
+        // cfg.set_max_reconnect_attempts(-1); // REMOVED - handled by builder
         
         connection_->set_client_config(cfg);
 
@@ -105,8 +113,32 @@ bool SignalRClient::Initialize(const std::string& hub_url, const std::string& to
             }
         });
 
+        // Register Notification handler to confirm connection (like the example code)
+        // Server sends "Notification" when client connects successfully
+        connection_->on("Notification", [this](const std::vector<signalr::value>& args) {
+            if (args.empty()) {
+                return;
+            }
+            std::string message = args[0].as_string();
+            ESP_LOGI(TAG, "🔔 Notification from server: %s", message.c_str());
+            
+            // Confirm connection is truly established
+            if (!connection_confirmed_) {
+                connection_confirmed_ = true;
+                ESP_LOGI(TAG, "╔══════════════════════════════════════════════════════╗");
+                ESP_LOGI(TAG, "║  ✓✓✓ SIGNALR CONNECTION CONFIRMED BY SERVER! ✓✓✓    ║");
+                ESP_LOGI(TAG, "╚══════════════════════════════════════════════════════╝");
+                ESP_LOGI(TAG, "Memory after connect: internal=%lu, min_free=%lu",
+                         (unsigned long)heap_caps_get_free_size(MALLOC_CAP_INTERNAL),
+                         (unsigned long)heap_caps_get_minimum_free_size(MALLOC_CAP_INTERNAL));
+            }
+        });
+
         initialized_ = true;
         ESP_LOGI(TAG, "SignalR client initialized with URL: %s", hub_url_.c_str());
+        ESP_LOGI(TAG, "Memory after init: internal=%lu, PSRAM=%lu",
+                 (unsigned long)heap_caps_get_free_size(MALLOC_CAP_INTERNAL),
+                 (unsigned long)heap_caps_get_free_size(MALLOC_CAP_SPIRAM));
         return true;
 
     } catch (const std::exception& e) {
@@ -127,7 +159,13 @@ bool SignalRClient::Connect() {
     }
 
     try {
+        // Log memory status before connection attempt
         ESP_LOGI(TAG, "Connecting to SignalR hub...");
+        ESP_LOGI(TAG, "Memory before connect: internal=%lu, PSRAM=%lu, min_free=%lu",
+                 (unsigned long)heap_caps_get_free_size(MALLOC_CAP_INTERNAL),
+                 (unsigned long)heap_caps_get_free_size(MALLOC_CAP_SPIRAM),
+                 (unsigned long)heap_caps_get_minimum_free_size(MALLOC_CAP_INTERNAL));
+        
         connection_lost_.store(false, std::memory_order_release);
         last_error_.clear();
         connecting_.store(true, std::memory_order_release);
