@@ -268,6 +268,34 @@ void SignalRClient::Disconnect() {
     }
 }
 
+void SignalRClient::Reset() {
+    ESP_LOGI(TAG, "Resetting SignalR client state...");
+    
+    // Disconnect if connected
+    Disconnect();
+    
+    // Wait a bit for disconnect to complete
+    vTaskDelay(pdMS_TO_TICKS(100));
+    
+    // Clear stored URL (contains token as query parameter) and token
+    hub_url_.clear();
+    token_.clear();
+    
+    // Reset initialization flags
+    initialized_ = false;
+    connection_confirmed_ = false;
+    connecting_.store(false, std::memory_order_release);
+    
+    // Reset connection object
+    connection_.reset();
+    
+    // Clear callbacks (optional, but ensures clean state)
+    on_custom_message_ = nullptr;
+    on_connection_state_changed_ = nullptr;
+    
+    ESP_LOGI(TAG, "SignalR client reset complete - can be re-initialized");
+}
+
 bool SignalRClient::Reconnect() {
     if (!initialized_) {
         ESP_LOGW(TAG, "SignalR client not initialized, cannot reconnect");

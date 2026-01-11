@@ -269,21 +269,39 @@ void Application::Run() {
                 static int signalr_disconnect_detect_count = 0;
                 auto& signalr = SignalRClient::GetInstance();
                 if (signalr.IsInitialized()) {
-                    // Pure polling: check if disconnected and not currently connecting
-                    if (!signalr.IsConnected() && !signalr.IsConnecting()) {
-                        signalr_disconnect_detect_count++;
-                        // Wait for 2 consecutive checks (2 seconds) to confirm disconnect
-                        // Reduced from 3 to 2 since we no longer have callback notification
-                        if (signalr_disconnect_detect_count >= 2) {
-                            signalr_disconnect_detect_count = 0;
-                            // Only attempt reconnection when device is idle
-                            if (GetDeviceState() == kDeviceStateIdle) {
-                                signalr.PerformReconnect();
-                            }
-                        }
-                    } else {
-                        // Reset counter when connected or connecting
+                    // First, check if token is still valid before attempting reconnect
+                    Settings token_storage("keycloak", false);
+                    std::string token = token_storage.GetString("access_token", "");
+                    int64_t expires_at = token_storage.GetInt("access_expires", 0);
+                    
+                    struct timeval tv;
+                    gettimeofday(&tv, NULL);
+                    int64_t now = tv.tv_sec;
+                    
+                    bool token_valid = !token.empty() && expires_at > now;
+                    
+                    if (!token_valid) {
+                        // Token expired or missing - destroy SignalR to save resources
+                        ESP_LOGW(TAG, "Token expired or missing - destroying SignalR to save resources");
+                        signalr.Reset();
                         signalr_disconnect_detect_count = 0;
+                    } else {
+                        // Token valid - proceed with reconnection check
+                        // Pure polling: check if disconnected and not currently connecting
+                        if (!signalr.IsConnected() && !signalr.IsConnecting()) {
+                            signalr_disconnect_detect_count++;
+                            // Wait for 2 consecutive checks (2 seconds) to confirm disconnect
+                            if (signalr_disconnect_detect_count >= 2) {
+                                signalr_disconnect_detect_count = 0;
+                                // Only attempt reconnection when device is idle
+                                if (GetDeviceState() == kDeviceStateIdle) {
+                                    signalr.PerformReconnect();
+                                }
+                            }
+                        } else {
+                            // Reset counter when connected or connecting
+                            signalr_disconnect_detect_count = 0;
+                        }
                     }
                 }
             }
@@ -705,10 +723,16 @@ void Application::InitializeSignalR() {
         }
     } else {
         ESP_LOGW(TAG, "No saved token found");
-        ESP_LOGW(TAG, "SignalR will connect without token");
-        ESP_LOGW(TAG, "To authenticate: Use MCP keycloak login tool");
     }
     ESP_LOGI(TAG, "==========================================");
+    
+    // 🔒 Only initialize SignalR if we have a valid token
+    // Without token, SignalR functionality is limited/useless, so skip to save resources
+    if (token.empty()) {
+        ESP_LOGI(TAG, "No valid token - skipping SignalR initialization to save resources");
+        ESP_LOGI(TAG, "SignalR will be initialized after successful login");
+        return;
+    }
     
     auto& signalr = SignalRClient::GetInstance();
     

@@ -52,6 +52,12 @@ public:
     void Disconnect();
 
     /**
+     * Reset the SignalR client state (disconnect and clear all stored tokens/URLs)
+     * After calling this, Initialize() can be called again with new credentials
+     */
+    void Reset();
+
+    /**
      * Reconnect to the SignalR hub (if previously initialized)
      * @return true if reconnection started successfully
      */
@@ -141,6 +147,7 @@ public:
     bool Initialize(const std::string&, const std::string& = "") { return false; }
     bool Connect() { return false; }
     void Disconnect() {}
+    void Reset() {}
     bool Reconnect() { return false; }
     bool IsInitialized() const { return false; }
     bool IsConnected() const { return false; }

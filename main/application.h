@@ -121,6 +121,13 @@ public:
      */
     void ResetProtocol();
 
+    /**
+     * Initialize or reinitialize SignalR client
+     * Reads token from NVS and connects to SignalR hub
+     * Safe to call multiple times - will reset and reinitialize if already initialized
+     */
+    void InitializeSignalR();
+
 private:
     Application();
     ~Application();
@@ -162,7 +169,6 @@ private:
     void CheckAssetsVersion();
     void CheckNewVersion();
     void InitializeProtocol();
-    void InitializeSignalR();
     void HandleSignalRMessage(const std::string& message);
     void HandleSignalRImageMessage(const char* url);
     void HandleSignalRAudioMessage(const char* url);

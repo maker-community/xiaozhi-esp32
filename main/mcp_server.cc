@@ -20,6 +20,7 @@
 #include "lvgl_theme.h"
 #include "lvgl_display.h"
 #include "keycloak_auth.h"
+#include "signalr_client.h"
 #include "assets/lang_config.h"
 
 #define TAG "MCP"
@@ -699,6 +700,20 @@ void McpServer::AddUserOnlyTools() {
                                 Application::GetInstance().Alert(Lang::Strings::LOGIN_SUCCESS, 
                                     Lang::Strings::LOGIN_SUCCESS_MESSAGE, "check_circle", "");
                                 
+                                // Re-initialize SignalR with new token
+#ifdef CONFIG_ENABLE_SIGNALR_CLIENT
+                                {
+                                    auto& signalr = SignalRClient::GetInstance();
+                                    // Reset first to clear old state (if any)
+                                    if (signalr.IsInitialized()) {
+                                        ESP_LOGI(TAG, "Resetting SignalR to use new token");
+                                        signalr.Reset();
+                                    }
+                                    // Re-initialize SignalR with the new token
+                                    Application::GetInstance().InitializeSignalR();
+                                }
+#endif
+                                
                                 // 使用定时器在3秒后清除Alert（非阻塞）
                                 esp_timer_handle_t dismiss_timer;
                                 esp_timer_create_args_t timer_args = {
@@ -823,6 +838,16 @@ void McpServer::AddUserOnlyTools() {
                 KeycloakAuth auth(server_url, realm, client_id);
                 bool was_logged_in = auth.IsAuthenticated();
                 auth.ClearTokens();
+                
+                // Also reset SignalR client to clear any stored token in URL
+                // This ensures reconnection will not use the old token
+#ifdef CONFIG_ENABLE_SIGNALR_CLIENT
+                auto& signalr = SignalRClient::GetInstance();
+                if (signalr.IsInitialized()) {
+                    ESP_LOGI(TAG, "Resetting SignalR client to clear stored token");
+                    signalr.Reset();
+                }
+#endif
                 
                 ESP_LOGI(TAG, "User logged out successfully (was authenticated: %s)", was_logged_in ? "yes" : "no");
                 
