@@ -1,5 +1,6 @@
 #include <esp_log.h>
 #include <esp_err.h>
+#include <esp_heap_caps.h>
 #include <string>
 #include <cstdlib>
 #include <cstring>
@@ -270,21 +271,31 @@ bool LvglDisplay::SnapshotToJpeg(std::string& jpeg_data, int quality) {
 }
 
 void LvglDisplay::ShowQRCode(const char* data, const char* title, const char* subtitle) {
+    ESP_LOGI(TAG, "========== SHOW QR CODE START ==========");
+    ESP_LOGI(TAG, "QR Data: %s", data ? data : "(null)");
+    ESP_LOGI(TAG, "Title: %s", title ? title : "(null)");
+    ESP_LOGI(TAG, "Subtitle: %s", subtitle ? subtitle : "(null)");
+    ESP_LOGI(TAG, "Memory before QR generation:");
+    ESP_LOGI(TAG, "  Internal heap: %lu bytes", (unsigned long)heap_caps_get_free_size(MALLOC_CAP_INTERNAL));
+    ESP_LOGI(TAG, "  PSRAM: %lu bytes", (unsigned long)heap_caps_get_free_size(MALLOC_CAP_SPIRAM));
+    
     DisplayLockGuard lock(this);
+    ESP_LOGI(TAG, "Display lock acquired");
     
     // Hide existing QR code if any
     if (qrcode_container_ != nullptr) {
+        ESP_LOGI(TAG, "Hiding existing QR code container");
         lv_obj_delete(qrcode_container_);
         qrcode_container_ = nullptr;
         qrcode_obj_ = nullptr;
     }
     
     if (data == nullptr || strlen(data) == 0) {
-        ESP_LOGW(TAG, "QR code data is empty");
+        ESP_LOGW(TAG, "QR code data is empty or null, returning");
         return;
     }
     
-    ESP_LOGI(TAG, "Showing QR code: %s", data);
+    ESP_LOGI(TAG, "Generating QR code for URL (length=%d)...", strlen(data));
     
     // Create context for the callback
     QRContext context = {this, title, subtitle, false};
@@ -338,18 +349,27 @@ void LvglDisplay::ShowQRCode(const char* data, const char* title, const char* su
             
             // Allocate buffer for canvas (RGB565 format for LVGL 9.x)
             size_t buf_size = canvas_size * canvas_size * sizeof(lv_color_t);
+            ESP_LOGI(TAG, "Allocating canvas buffer: %d bytes (canvas: %dx%d, scale: %d)", 
+                     buf_size, canvas_size, canvas_size, scale);
+            
             lv_color_t* canvas_buf = (lv_color_t*)heap_caps_malloc(buf_size, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
             if (canvas_buf == nullptr) {
+                ESP_LOGW(TAG, "PSRAM allocation failed, trying internal RAM...");
                 canvas_buf = (lv_color_t*)malloc(buf_size);
             }
             
             if (canvas_buf == nullptr) {
-                ESP_LOGE(TAG, "Failed to allocate canvas buffer");
+                ESP_LOGE(TAG, "❌ CRITICAL: Failed to allocate canvas buffer (%d bytes)!", buf_size);
+                ESP_LOGE(TAG, "  Free internal: %lu, Free PSRAM: %lu", 
+                         (unsigned long)heap_caps_get_free_size(MALLOC_CAP_INTERNAL),
+                         (unsigned long)heap_caps_get_free_size(MALLOC_CAP_SPIRAM));
                 lv_obj_delete(disp->qrcode_container_);
                 disp->qrcode_container_ = nullptr;
                 disp->qrcode_obj_ = nullptr;
+                ctx->success = false;
                 return;
             }
+            ESP_LOGI(TAG, "✓ Canvas buffer allocated successfully");
             
             // Set buffer to canvas first
             lv_canvas_set_buffer(disp->qrcode_obj_, canvas_buf, canvas_size, canvas_size, LV_COLOR_FORMAT_RGB565);
@@ -389,7 +409,11 @@ void LvglDisplay::ShowQRCode(const char* data, const char* title, const char* su
             }
             
             ctx->success = true;
-            ESP_LOGI(TAG, "QR code displayed successfully");
+            ESP_LOGI(TAG, "✓ QR code displayed successfully!");
+            ESP_LOGI(TAG, "Memory after QR display:");
+            ESP_LOGI(TAG, "  Internal: %lu, PSRAM: %lu", 
+                     (unsigned long)heap_caps_get_free_size(MALLOC_CAP_INTERNAL),
+                     (unsigned long)heap_caps_get_free_size(MALLOC_CAP_SPIRAM));
         },
         .max_qrcode_version = 10,
         .qrcode_ecc_level = ESP_QRCODE_ECC_LOW,
@@ -398,18 +422,29 @@ void LvglDisplay::ShowQRCode(const char* data, const char* title, const char* su
     // Store context in static variable for callback access
     s_qr_context = &context;
     
+    ESP_LOGI(TAG, "Calling esp_qrcode_generate()...");
     esp_err_t ret = esp_qrcode_generate(&cfg, data);
+    ESP_LOGI(TAG, "esp_qrcode_generate() returned: %s (0x%x)", esp_err_to_name(ret), ret);
     
     // Clear static context
     s_qr_context = nullptr;
     
-    if (ret != ESP_OK || !context.success) {
-        ESP_LOGE(TAG, "Failed to generate or display QR code: %d", ret);
+    if (ret != ESP_OK) {
+        ESP_LOGE(TAG, "❌ esp_qrcode_generate FAILED: %s", esp_err_to_name(ret));
         return;
     }
+    
+    if (!context.success) {
+        ESP_LOGE(TAG, "❌ QR code generation succeeded but display callback failed");
+        ESP_LOGE(TAG, "  This may indicate memory allocation issues in the callback");
+        return;
+    }
+    
+    ESP_LOGI(TAG, "========== SHOW QR CODE COMPLETE ==========");
 }
 
 void LvglDisplay::HideQRCode() {
+    ESP_LOGI(TAG, "HideQRCode() called");
     DisplayLockGuard lock(this);
     
     if (qrcode_container_ != nullptr) {

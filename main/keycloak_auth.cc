@@ -27,24 +27,44 @@ std::string KeycloakAuth::GetTokenUrl() {
 }
 
 esp_err_t KeycloakAuth::RequestDeviceCode(DeviceCodeResponse& response) {
+    ESP_LOGI(TAG, "========== REQUEST DEVICE CODE ==========");
+    ESP_LOGI(TAG, "Server URL: %s", server_url_.c_str());
+    ESP_LOGI(TAG, "Realm: %s", realm_.c_str());
+    ESP_LOGI(TAG, "Client ID: %s", client_id_.c_str());
+    
     auto http = Board::GetInstance().GetNetwork()->CreateHttp(30);
-    
-    std::string url = GetDeviceAuthUrl();
-    std::string post_data = "client_id=" + client_id_;
-    
-    http->SetHeader("Content-Type", "application/x-www-form-urlencoded");
-    
-    if (!http->Open("POST", url)) {
-        ESP_LOGE(TAG, "Failed to open device auth URL");
+    if (http == nullptr) {
+        ESP_LOGE(TAG, "❌ Failed to create HTTP client! Network may not be initialized.");
         return ESP_FAIL;
     }
     
+    std::string url = GetDeviceAuthUrl();
+    ESP_LOGI(TAG, "Device Auth URL: %s", url.c_str());
+    
+    std::string post_data = "client_id=" + client_id_;
+    ESP_LOGI(TAG, "POST data: %s", post_data.c_str());
+    
+    http->SetHeader("Content-Type", "application/x-www-form-urlencoded");
+    
+    ESP_LOGI(TAG, "Opening HTTP connection...");
+    if (!http->Open("POST", url)) {
+        ESP_LOGE(TAG, "❌ Failed to open device auth URL. Check network and server availability.");
+        return ESP_FAIL;
+    }
+    ESP_LOGI(TAG, "✓ HTTP connection opened");
+    
+    ESP_LOGI(TAG, "Writing request body...");
     http->Write(post_data.c_str(), post_data.size());
     http->Write("", 0); // Finish writing
+    ESP_LOGI(TAG, "✓ Request sent");
     
     int status_code = http->GetStatusCode();
+    ESP_LOGI(TAG, "Response status code: %d", status_code);
+    
     if (status_code != 200) {
-        ESP_LOGE(TAG, "Device auth request failed with status: %d", status_code);
+        ESP_LOGE(TAG, "❌ Device auth request failed with HTTP status: %d", status_code);
+        std::string error_response = http->ReadAll();
+        ESP_LOGE(TAG, "Error response: %s", error_response.c_str());
         http->Close();
         return ESP_FAIL;
     }
@@ -52,7 +72,8 @@ esp_err_t KeycloakAuth::RequestDeviceCode(DeviceCodeResponse& response) {
     std::string json_response = http->ReadAll();
     http->Close();
     
-    ESP_LOGI(TAG, "Device code response: %s", json_response.c_str());
+    ESP_LOGI(TAG, "✓ Device code response received (length=%d)", json_response.length());
+    ESP_LOGI(TAG, "Response: %s", json_response.c_str());
     
     return ParseJsonResponse(json_response, response);
 }

@@ -6,6 +6,8 @@
 #include "mcp_server.h"
 #include <esp_log.h>
 #include <esp_app_desc.h>
+#include <esp_heap_caps.h>
+#include <esp_timer.h>
 #include <algorithm>
 #include <cstring>
 #include <esp_pthread.h>
@@ -21,6 +23,14 @@
 #include "assets/lang_config.h"
 
 #define TAG "MCP"
+
+// Keycloak登录任务静态资源（文件级别，任务内可访问）
+static StackType_t* s_login_task_stack = nullptr;
+static StaticTask_t* s_login_task_buffer = nullptr;
+static volatile bool s_login_task_running = false;
+static volatile bool s_login_task_cancelled = false;  // 取消标志
+static TaskHandle_t s_login_task_handle = nullptr;    // 任务句柄
+static const size_t LOGIN_STACK_SIZE = 8192;
 
 McpServer::McpServer() {
 }
@@ -308,11 +318,13 @@ void McpServer::AddUserOnlyTools() {
         "- Check login status or ask 'am I logged in?'\n"
         "- Login to Keycloak account (shows QR code on device screen)\n"
         "- Logout or sign out from account\n"
+        "- Cancel an ongoing login process\n"
         "\n"
         "Actions:\n"
         "- 'check': Returns whether user is currently authenticated\n"
         "- 'login': Starts OAuth2 device flow, displays QR code and user code on device, waits for user to authorize on phone/computer\n"
         "- 'logout': Clears authentication tokens\n"
+        "- 'cancel': Cancels the ongoing login process and hides QR code\n"
         "\n"
         "Server: https://auth.verdure-hiro.cn/ (realm: maker-community)",
         PropertyList({
@@ -349,132 +361,462 @@ void McpServer::AddUserOnlyTools() {
                 return result;
                 
             } else if (action == "login") {
-                // 在独立任务中执行登录，避免阻塞主线程
-                auto login_task = [server_url, realm, client_id]() {
-                    auto& board = Board::GetInstance();
-                    KeycloakAuth auth(server_url, realm, client_id);
-                    
-                    KeycloakAuth::DeviceCodeResponse device_response;
-                    esp_err_t ret = auth.RequestDeviceCode(device_response);
-                    if (ret != ESP_OK) {
-                        ESP_LOGE(TAG, "Failed to request device code from Keycloak");
-                        auto& app = Application::GetInstance();
-                        app.Alert(Lang::Strings::LOGIN_ERROR, Lang::Strings::LOGIN_ERROR_START_FAILED, "triangle_exclamation", "");
-                        vTaskDelay(pdMS_TO_TICKS(2000));
-                        app.DismissAlert();
-                        return;
-                    }
-                    
-                    ESP_LOGI(TAG, "Device code obtained successfully");
-                    ESP_LOGI(TAG, "User code: %s", device_response.user_code.c_str());
-                    ESP_LOGI(TAG, "Verification URI: %s", device_response.verification_uri.c_str());
-                    if (!device_response.verification_uri_complete.empty()) {
-                        ESP_LOGI(TAG, "Complete URI: %s", device_response.verification_uri_complete.c_str());
-                    }
-                    ESP_LOGI(TAG, "Expires in: %d seconds", device_response.expires_in);
-                    
-                    // 使用服务器返回的超时时间
-                    int timeout = device_response.expires_in;
-                    
-                    // 优先使用完整URL（包含user_code），扫码更方便
-                    std::string display_url = device_response.verification_uri_complete.empty() 
-                        ? device_response.verification_uri 
-                        : device_response.verification_uri_complete;
-                    
-                    // 显示真正的二维码
-                    auto display = board.GetDisplay();
-                    if (display != nullptr) {
-                        char subtitle[64];
-                        snprintf(subtitle, sizeof(subtitle), Lang::Strings::LOGIN_USER_CODE, device_response.user_code.c_str());
-                        display->ShowQRCode(display_url.c_str(), Lang::Strings::LOGIN_QR_TITLE, subtitle);
-                    }
-                    
-                    ESP_LOGI(TAG, "Login QR code displayed on device screen");
-                    ESP_LOGI(TAG, "URL: %s", display_url.c_str());
-                    ESP_LOGI(TAG, "User Code: %s", device_response.user_code.c_str());
-                    ESP_LOGI(TAG, "Starting token polling (interval: %ds, timeout: %ds)", device_response.interval, timeout);
-                    
-                    int poll_interval = device_response.interval;
-                    int max_attempts = timeout / poll_interval;
-                    bool success = false;
-                    KeycloakAuth::TokenResponse token_response;
-                    
-                    // 立即开始第一次轮询，然后每隔interval秒轮询一次
-                    for (int i = 0; i < max_attempts; i++) {
-                        if (i > 0) {
-                            vTaskDelay(pdMS_TO_TICKS(poll_interval * 1000));
-                        }
-                        
-                        // 不需要每次都重新显示二维码，因为它会一直显示直到隐藏
-                        
-                        ESP_LOGD(TAG, "Polling token... attempt %d/%d", i + 1, max_attempts);
-                        ret = auth.PollToken(device_response.device_code, token_response);
-                        
-                        if (ret == ESP_OK) {
-                            success = true;
-                            ESP_LOGI(TAG, "Token obtained successfully");
-                            break;
-                        } else if (ret == ESP_ERR_TIMEOUT) {
-                            // authorization_pending 或 slow_down，继续等待
-                            continue;
-                        } else {
-                            // 其他错误
-                            ESP_LOGE(TAG, "Failed to poll token from Keycloak");
-                            if (display != nullptr) {
-                                display->HideQRCode();
-                            }
-                            auto& app = Application::GetInstance();
-                            app.Alert(Lang::Strings::LOGIN_ERROR, Lang::Strings::LOGIN_ERROR_AUTH_FAILED, "triangle_exclamation", "");
-                            vTaskDelay(pdMS_TO_TICKS(2000));
-                            app.Alert("", "", "", "");  // 清除提示
-                            return;
-                        }
-                    }
-                    
-                    if (!success) {
-                        if (display != nullptr) {
-                            display->HideQRCode();
-                        }
-                        auto& app = Application::GetInstance();
-                        ESP_LOGW(TAG, "Login timeout - user did not complete authentication within %d seconds", timeout);
-                        app.Alert(Lang::Strings::LOGIN_TIMEOUT, Lang::Strings::LOGIN_TIMEOUT_MESSAGE, "triangle_exclamation", "");
-                        vTaskDelay(pdMS_TO_TICKS(2000));
-                        app.Alert("", "", "", "");  // 清除提示
-                        return;
-                    }
-                    
-                    ESP_LOGI(TAG, "Authentication successful, saving tokens");
-                    auto token = token_response.access_token;
-                    ESP_LOGI(TAG, "Access token obtained (length: %d)", token.length());
-                    ESP_LOGI(TAG, "Token preview: %.50s...", token.c_str());
-                    
-                    auth.SaveTokens(token_response);
-                    
-                    // 隐藏二维码
-                    if (display != nullptr) {
-                        display->HideQRCode();
-                    }
-                    
-                    auto& app = Application::GetInstance();
-                    app.Alert(Lang::Strings::LOGIN_SUCCESS, Lang::Strings::LOGIN_SUCCESS_MESSAGE, "check_circle", "");
-                    vTaskDelay(pdMS_TO_TICKS(2000));
-                    app.Alert("", "", "", "");  // 清除提示
-                    
-                    ESP_LOGI(TAG, "Login flow completed successfully");
+                // 打印登录前的内存状态
+                ESP_LOGI(TAG, "========== KEYCLOAK LOGIN START ==========");
+                ESP_LOGI(TAG, "Memory BEFORE login:");
+                ESP_LOGI(TAG, "  Internal heap: %lu bytes free", (unsigned long)heap_caps_get_free_size(MALLOC_CAP_INTERNAL));
+                ESP_LOGI(TAG, "  PSRAM: %lu bytes free", (unsigned long)heap_caps_get_free_size(MALLOC_CAP_SPIRAM));
+                ESP_LOGI(TAG, "  Min ever free: %lu bytes", (unsigned long)heap_caps_get_minimum_free_size(MALLOC_CAP_INTERNAL));
+                
+                // 在主线程检查登录状态（NVS读取）
+                ESP_LOGI(TAG, "Checking existing authentication status (NVS read on main thread)...");
+                KeycloakAuth auth_check(server_url, realm, client_id);
+                if (auth_check.IsAuthenticated()) {
+                    ESP_LOGI(TAG, "User is already authenticated!");
+                    cJSON* result = cJSON_CreateObject();
+                    cJSON_AddStringToObject(result, "action", "login");
+                    cJSON_AddStringToObject(result, "status", "already_logged_in");
+                    cJSON_AddStringToObject(result, "message", "You are already logged in. Use action=logout first if you want to re-login.");
+                    return result;
+                }
+                
+                // 登录上下文结构体
+                struct LoginContext {
+                    std::string server_url;
+                    std::string realm;
+                    std::string client_id;
                 };
                 
-                // 创建独立任务执行登录，不阻塞主线程
-                xTaskCreate([](void* arg) {
-                    auto task = static_cast<std::function<void()>*>(arg);
-                    (*task)();
-                    delete task;
-                    vTaskDelete(nullptr);
-                }, "keycloak_login", 8192, new std::function<void()>(login_task), 5, nullptr);
+                // 使用文件级别的静态变量 s_login_task_stack, s_login_task_buffer, s_login_task_running, LOGIN_STACK_SIZE
+                
+                // 检查是否有登录任务正在运行
+                if (s_login_task_running) {
+                    ESP_LOGW(TAG, "⚠️ Login task is already running, please wait...");
+                    cJSON* result = cJSON_CreateObject();
+                    cJSON_AddStringToObject(result, "action", "login");
+                    cJSON_AddStringToObject(result, "status", "in_progress");
+                    cJSON_AddStringToObject(result, "message", "Login is already in progress. Please wait for the current login to complete or timeout.");
+                    return result;
+                }
+                
+                if (s_login_task_stack == nullptr) {
+                    s_login_task_stack = (StackType_t*)heap_caps_malloc(LOGIN_STACK_SIZE, MALLOC_CAP_SPIRAM);
+                    if (s_login_task_stack == nullptr) {
+                        ESP_LOGE(TAG, "❌ Failed to allocate task stack from PSRAM!");
+                        throw std::runtime_error("Failed to allocate login task stack");
+                    }
+                    ESP_LOGI(TAG, "✓ Login task stack allocated from PSRAM (reusable)");
+                }
+                
+                if (s_login_task_buffer == nullptr) {
+                    s_login_task_buffer = (StaticTask_t*)heap_caps_malloc(sizeof(StaticTask_t), MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT);
+                    if (s_login_task_buffer == nullptr) {
+                        ESP_LOGE(TAG, "❌ Failed to allocate task buffer!");
+                        throw std::runtime_error("Failed to allocate login task buffer");
+                    }
+                    ESP_LOGI(TAG, "✓ Login task buffer allocated from internal RAM (reusable)");
+                }
+                
+                // 标记任务开始运行，清除取消标志
+                s_login_task_running = true;
+                s_login_task_cancelled = false;
+                
+                // 创建任务参数（在堆上，任务结束后通过Schedule释放）
+                auto* ctx = new LoginContext{server_url, realm, client_id};
+                
+                // 创建PSRAM栈任务执行HTTP操作
+                // 注意：此任务不能访问NVS/Flash！
+                TaskHandle_t task_handle = xTaskCreateStatic(
+                    [](void* arg) {
+                        auto* ctx = static_cast<LoginContext*>(arg);
+                        ESP_LOGI(TAG, "[LOGIN TASK] Started on PSRAM stack");
+                        ESP_LOGI(TAG, "[LOGIN TASK] Stack high water mark: %lu", 
+                                 (unsigned long)uxTaskGetStackHighWaterMark(nullptr));
+                        
+                        auto& board = Board::GetInstance();
+                        auto& app = Application::GetInstance();
+                        
+                        // ===== 步骤1: 请求设备码 (HTTP, 不访问Flash) =====
+                        ESP_LOGI(TAG, "[LOGIN TASK] Requesting device code...");
+                        auto http = board.GetNetwork()->CreateHttp(5);  // 5秒超时，快速失败重试
+                        if (http == nullptr) {
+                            ESP_LOGE(TAG, "[LOGIN TASK] ❌ Failed to create HTTP client!");
+                            s_login_task_running = false;  // 清除运行标志
+                            app.Schedule([ctx]() {
+                                Application::GetInstance().Alert(Lang::Strings::LOGIN_ERROR, 
+                                    Lang::Strings::LOGIN_ERROR_START_FAILED, "triangle_exclamation", "");
+                                // Alert将在几秒后自动消失或被下一个操作覆盖
+                                delete ctx;
+                            });
+                            vTaskDelete(nullptr);
+                            return;
+                        }
+                        
+                        // 确保server_url末尾没有斜杠
+                        std::string base_url = ctx->server_url;
+                        while (!base_url.empty() && base_url.back() == '/') {
+                            base_url.pop_back();
+                        }
+                        std::string device_auth_url = base_url + "/realms/" + ctx->realm + 
+                                                      "/protocol/openid-connect/auth/device";
+                        std::string post_data = "client_id=" + ctx->client_id;
+                        
+                        ESP_LOGI(TAG, "[LOGIN TASK] Base URL (trimmed): %s", base_url.c_str());
+                        
+                        http->SetHeader("Content-Type", "application/x-www-form-urlencoded");
+                        
+                        ESP_LOGI(TAG, "[LOGIN TASK] POST %s", device_auth_url.c_str());
+                        if (!http->Open("POST", device_auth_url)) {
+                            ESP_LOGE(TAG, "[LOGIN TASK] ❌ Failed to open HTTP connection!");
+                            s_login_task_running = false;  // 清除运行标志
+                            app.Schedule([ctx]() {
+                                Application::GetInstance().Alert(Lang::Strings::LOGIN_ERROR,
+                                    Lang::Strings::LOGIN_ERROR_START_FAILED, "triangle_exclamation", "");
+                                delete ctx;
+                            });
+                            vTaskDelete(nullptr);
+                            return;
+                        }
+                        
+                        http->Write(post_data.c_str(), post_data.size());
+                        http->Write("", 0);
+                        
+                        int status_code = http->GetStatusCode();
+                        ESP_LOGI(TAG, "[LOGIN TASK] Response status: %d", status_code);
+                        
+                        if (status_code != 200) {
+                            std::string error_body = http->ReadAll();
+                            ESP_LOGE(TAG, "[LOGIN TASK] ❌ Device code request failed: %s", error_body.c_str());
+                            http->Close();
+                            s_login_task_running = false;  // 清除运行标志
+                            app.Schedule([ctx]() {
+                                Application::GetInstance().Alert(Lang::Strings::LOGIN_ERROR,
+                                    Lang::Strings::LOGIN_ERROR_START_FAILED, "triangle_exclamation", "");
+                                delete ctx;
+                            });
+                            vTaskDelete(nullptr);
+                            return;
+                        }
+                        
+                        std::string json_response = http->ReadAll();
+                        http->Close();
+                        ESP_LOGI(TAG, "[LOGIN TASK] ✓ Device code response: %s", json_response.c_str());
+                        
+                        // 解析响应
+                        cJSON* root = cJSON_Parse(json_response.c_str());
+                        if (!root) {
+                            ESP_LOGE(TAG, "[LOGIN TASK] ❌ Failed to parse JSON response!");
+                            s_login_task_running = false;  // 清除运行标志
+                            app.Schedule([ctx]() {
+                                Application::GetInstance().Alert(Lang::Strings::LOGIN_ERROR,
+                                    Lang::Strings::LOGIN_ERROR_START_FAILED, "triangle_exclamation", "");
+                                delete ctx;
+                            });
+                            vTaskDelete(nullptr);
+                            return;
+                        }
+                        
+                        // 安全获取JSON字段，检查空指针
+                        cJSON* j_device_code = cJSON_GetObjectItem(root, "device_code");
+                        cJSON* j_user_code = cJSON_GetObjectItem(root, "user_code");
+                        cJSON* j_verification_uri = cJSON_GetObjectItem(root, "verification_uri");
+                        cJSON* j_expires_in = cJSON_GetObjectItem(root, "expires_in");
+                        cJSON* j_interval = cJSON_GetObjectItem(root, "interval");
+                        
+                        if (!j_device_code || !cJSON_IsString(j_device_code) ||
+                            !j_user_code || !cJSON_IsString(j_user_code) ||
+                            !j_verification_uri || !cJSON_IsString(j_verification_uri) ||
+                            !j_expires_in || !cJSON_IsNumber(j_expires_in)) {
+                            ESP_LOGE(TAG, "[LOGIN TASK] ❌ Invalid device code response format!");
+                            cJSON_Delete(root);
+                            s_login_task_running = false;
+                            app.Schedule([ctx]() {
+                                Application::GetInstance().Alert(Lang::Strings::LOGIN_ERROR,
+                                    Lang::Strings::LOGIN_ERROR_START_FAILED, "triangle_exclamation", "");
+                                delete ctx;
+                            });
+                            vTaskDelete(nullptr);
+                            return;
+                        }
+                        
+                        std::string device_code = j_device_code->valuestring;
+                        std::string user_code = j_user_code->valuestring;
+                        std::string verification_uri = j_verification_uri->valuestring;
+                        int expires_in = j_expires_in->valueint;
+                        int interval = (j_interval && cJSON_IsNumber(j_interval)) ? j_interval->valueint : 5;
+                        
+                        cJSON* uri_complete = cJSON_GetObjectItem(root, "verification_uri_complete");
+                        std::string display_url = (uri_complete && cJSON_IsString(uri_complete)) 
+                                                  ? uri_complete->valuestring 
+                                                  : verification_uri;
+                        cJSON_Delete(root);
+                        
+                        ESP_LOGI(TAG, "[LOGIN TASK] User Code: %s", user_code.c_str());
+                        ESP_LOGI(TAG, "[LOGIN TASK] Verification URI: %s", display_url.c_str());
+                        ESP_LOGI(TAG, "[LOGIN TASK] Expires in: %d seconds", expires_in);
+                        
+                        // ===== 步骤2: 在主线程显示二维码 =====
+                        std::string user_code_copy = user_code;
+                        std::string display_url_copy = display_url;
+                        app.Schedule([user_code_copy, display_url_copy]() {
+                            auto display = Board::GetInstance().GetDisplay();
+                            if (display != nullptr) {
+                                char subtitle[64];
+                                snprintf(subtitle, sizeof(subtitle), Lang::Strings::LOGIN_USER_CODE, user_code_copy.c_str());
+                                display->ShowQRCode(display_url_copy.c_str(), Lang::Strings::LOGIN_QR_TITLE, subtitle);
+                                ESP_LOGI(TAG, "[MAIN] ✓ QR code displayed");
+                            }
+                        });
+                        
+                        // ===== 步骤3: 轮询token (HTTP, 不访问Flash) =====
+                        // 确保base_url末尾没有斜杠
+                        std::string token_base_url = ctx->server_url;
+                        while (!token_base_url.empty() && token_base_url.back() == '/') {
+                            token_base_url.pop_back();
+                        }
+                        std::string token_url = token_base_url + "/realms/" + ctx->realm + 
+                                               "/protocol/openid-connect/token";
+                        std::string token_post = "grant_type=urn:ietf:params:oauth:grant-type:device_code&"
+                                                "client_id=" + ctx->client_id + "&"
+                                                "device_code=" + device_code;
+                        
+                        int max_attempts = expires_in / interval;
+                        bool success = false;
+                        bool cancelled = false;
+                        std::string access_token, refresh_token;
+                        int token_expires_in = 0, refresh_expires_in = 0;
+                        
+                        for (int i = 0; i < max_attempts; i++) {
+                            // 检查是否被取消
+                            if (s_login_task_cancelled) {
+                                ESP_LOGI(TAG, "[LOGIN TASK] Login cancelled by user");
+                                cancelled = true;
+                                break;
+                            }
+                            
+                            if (i > 0) {
+                                // 分段睡眠，以便更快响应取消
+                                for (int j = 0; j < interval * 10; j++) {
+                                    if (s_login_task_cancelled) {
+                                        ESP_LOGI(TAG, "[LOGIN TASK] Login cancelled during wait");
+                                        cancelled = true;
+                                        break;
+                                    }
+                                    vTaskDelay(pdMS_TO_TICKS(100));
+                                }
+                                if (cancelled) break;
+                            }
+                            
+                            ESP_LOGD(TAG, "[LOGIN TASK] Polling token... attempt %d/%d", i + 1, max_attempts);
+                            
+                            auto poll_http = board.GetNetwork()->CreateHttp(5);  // 5秒超时
+                            if (!poll_http) continue;
+                            
+                            poll_http->SetHeader("Content-Type", "application/x-www-form-urlencoded");
+                            if (!poll_http->Open("POST", token_url)) {
+                                continue;
+                            }
+                            
+                            poll_http->Write(token_post.c_str(), token_post.size());
+                            poll_http->Write("", 0);
+                            
+                            int poll_status = poll_http->GetStatusCode();
+                            std::string poll_response = poll_http->ReadAll();
+                            poll_http->Close();
+                            
+                            if (poll_status == 200) {
+                                // 成功获取token
+                                cJSON* token_json = cJSON_Parse(poll_response.c_str());
+                                if (token_json) {
+                                    auto at = cJSON_GetObjectItem(token_json, "access_token");
+                                    auto rt = cJSON_GetObjectItem(token_json, "refresh_token");
+                                    auto ei = cJSON_GetObjectItem(token_json, "expires_in");
+                                    auto rei = cJSON_GetObjectItem(token_json, "refresh_expires_in");
+                                    
+                                    if (at) access_token = at->valuestring;
+                                    if (rt) refresh_token = rt->valuestring;
+                                    if (ei) token_expires_in = ei->valueint;
+                                    if (rei) refresh_expires_in = rei->valueint;
+                                    
+                                    cJSON_Delete(token_json);
+                                    success = true;
+                                    ESP_LOGI(TAG, "[LOGIN TASK] ✓ Token obtained! Length: %d", access_token.length());
+                                    break;
+                                }
+                            } else if (poll_status == 400) {
+                                // 检查是否是authorization_pending
+                                cJSON* err_json = cJSON_Parse(poll_response.c_str());
+                                if (err_json) {
+                                    auto error = cJSON_GetObjectItem(err_json, "error");
+                                    if (error && cJSON_IsString(error)) {
+                                        std::string err_str = error->valuestring;
+                                        cJSON_Delete(err_json);
+                                        if (err_str == "authorization_pending" || err_str == "slow_down") {
+                                            continue;  // 继续轮询
+                                        }
+                                    } else {
+                                        cJSON_Delete(err_json);
+                                    }
+                                }
+                                // 其他400错误，退出
+                                ESP_LOGE(TAG, "[LOGIN TASK] ❌ Token request failed: %s", poll_response.c_str());
+                                break;
+                            }
+                        }
+                        
+                        // ===== 步骤4: 通过Schedule在主线程保存token到NVS =====
+                        if (cancelled) {
+                            // 用户取消了登录，隐藏二维码即可，不需要显示额外提示
+                            app.Schedule([]() {
+                                auto display = Board::GetInstance().GetDisplay();
+                                if (display) display->HideQRCode();
+                                ESP_LOGI(TAG, "[MAIN] Login cancelled, QR code hidden");
+                            });
+                        } else if (success) {
+                            // 捕获所有需要的数据
+                            std::string server = ctx->server_url;
+                            std::string realm = ctx->realm;
+                            std::string client = ctx->client_id;
+                            
+                            app.Schedule([server, realm, client, access_token, refresh_token, 
+                                         token_expires_in, refresh_expires_in]() {
+                                ESP_LOGI(TAG, "[MAIN] Saving tokens to NVS...");
+                                
+                                // 在主线程创建KeycloakAuth并保存token
+                                KeycloakAuth auth(server, realm, client);
+                                KeycloakAuth::TokenResponse token_resp;
+                                token_resp.access_token = access_token;
+                                token_resp.refresh_token = refresh_token;
+                                token_resp.token_type = "Bearer";
+                                token_resp.expires_in = token_expires_in;
+                                token_resp.refresh_expires_in = refresh_expires_in;
+                                auth.SaveTokens(token_resp);
+                                
+                                // 隐藏二维码并显示成功
+                                auto display = Board::GetInstance().GetDisplay();
+                                if (display) display->HideQRCode();
+                                
+                                Application::GetInstance().Alert(Lang::Strings::LOGIN_SUCCESS, 
+                                    Lang::Strings::LOGIN_SUCCESS_MESSAGE, "check_circle", "");
+                                
+                                // 使用定时器在3秒后清除Alert（非阻塞）
+                                esp_timer_handle_t dismiss_timer;
+                                esp_timer_create_args_t timer_args = {
+                                    .callback = [](void* arg) {
+                                        Application::GetInstance().Schedule([]() {
+                                            Application::GetInstance().DismissAlert();
+                                        });
+                                        // 删除定时器自身
+                                        esp_timer_delete((esp_timer_handle_t)arg);
+                                    },
+                                    .arg = nullptr,
+                                    .dispatch_method = ESP_TIMER_TASK,
+                                    .name = "login_alert_dismiss",
+                                    .skip_unhandled_events = true
+                                };
+                                if (esp_timer_create(&timer_args, &dismiss_timer) == ESP_OK) {
+                                    // 将timer handle传给回调，以便删除自身
+                                    timer_args.arg = dismiss_timer;
+                                    esp_timer_start_once(dismiss_timer, 3000000);  // 3秒 = 3000000微秒
+                                }
+                                
+                                ESP_LOGI(TAG, "[MAIN] ✓ Login completed successfully!");
+                            });
+                        } else {
+                            app.Schedule([]() {
+                                auto display = Board::GetInstance().GetDisplay();
+                                if (display) display->HideQRCode();
+                                
+                                Application::GetInstance().Alert(Lang::Strings::LOGIN_TIMEOUT, 
+                                    Lang::Strings::LOGIN_TIMEOUT_MESSAGE, "triangle_exclamation", "");
+                                
+                                // 使用定时器在3秒后清除Alert（非阻塞）
+                                esp_timer_handle_t dismiss_timer;
+                                esp_timer_create_args_t timer_args = {
+                                    .callback = [](void* arg) {
+                                        Application::GetInstance().Schedule([]() {
+                                            Application::GetInstance().DismissAlert();
+                                        });
+                                        esp_timer_delete((esp_timer_handle_t)arg);
+                                    },
+                                    .arg = nullptr,
+                                    .dispatch_method = ESP_TIMER_TASK,
+                                    .name = "login_timeout_dismiss",
+                                    .skip_unhandled_events = true
+                                };
+                                if (esp_timer_create(&timer_args, &dismiss_timer) == ESP_OK) {
+                                    timer_args.arg = dismiss_timer;
+                                    esp_timer_start_once(dismiss_timer, 3000000);
+                                }
+                                
+                                ESP_LOGW(TAG, "[MAIN] Login timeout or failed");
+                            });
+                        }
+                        
+                        // 清理上下文
+                        delete ctx;
+                        
+                        // 清除运行标志和任务句柄
+                        s_login_task_running = false;
+                        s_login_task_handle = nullptr;
+                        
+                        ESP_LOGI(TAG, "[LOGIN TASK] Task ending, stack high water mark: %lu",
+                                 (unsigned long)uxTaskGetStackHighWaterMark(nullptr));
+                        vTaskDelete(nullptr);
+                    },
+                    "keycloak_login",
+                    LOGIN_STACK_SIZE / sizeof(StackType_t),
+                    ctx,
+                    5,  // 优先级
+                    s_login_task_stack,
+                    s_login_task_buffer
+                );
+                
+                if (task_handle == nullptr) {
+                    s_login_task_running = false;  // 清除运行标志
+                    delete ctx;
+                    ESP_LOGE(TAG, "❌ Failed to create login task!");
+                    throw std::runtime_error("Failed to create login task");
+                }
+                
+                // 保存任务句柄以便取消
+                s_login_task_handle = task_handle;
+                
+                ESP_LOGI(TAG, "✓ Login task created on PSRAM stack (handle: %p)", task_handle);
                 
                 cJSON* result = cJSON_CreateObject();
                 cJSON_AddStringToObject(result, "action", "login");
                 cJSON_AddStringToObject(result, "status", "started");
                 cJSON_AddStringToObject(result, "message", "Login process started. Please scan the QR code displayed on the device screen.");
+                return result;
+                
+            } else if (action == "cancel") {
+                // 取消正在进行的登录
+                if (!s_login_task_running) {
+                    ESP_LOGI(TAG, "No login in progress to cancel");
+                    cJSON* result = cJSON_CreateObject();
+                    cJSON_AddStringToObject(result, "action", "cancel");
+                    cJSON_AddBoolToObject(result, "success", false);
+                    cJSON_AddStringToObject(result, "status", "no_login_in_progress");
+                    cJSON_AddStringToObject(result, "message", "There is no login in progress to cancel.");
+                    return result;
+                }
+                
+                ESP_LOGI(TAG, "Cancelling login...");
+                s_login_task_cancelled = true;
+                
+                // 立即隐藏二维码
+                auto display = Board::GetInstance().GetDisplay();
+                if (display) {
+                    display->HideQRCode();
+                }
+                
+                // 任务会在下次检查取消标志时自行退出
+                cJSON* result = cJSON_CreateObject();
+                cJSON_AddStringToObject(result, "action", "cancel");
+                cJSON_AddBoolToObject(result, "success", true);
+                cJSON_AddStringToObject(result, "status", "cancelled");
+                cJSON_AddStringToObject(result, "message", "Login process has been cancelled.");
                 return result;
                 
             } else if (action == "logout") {
@@ -496,7 +838,7 @@ void McpServer::AddUserOnlyTools() {
                 return result;
                 
             } else {
-                throw std::runtime_error("Invalid action. Use: check, login, or logout");
+                throw std::runtime_error("Invalid action. Use: check, login, logout, or cancel");
             }
         });
 }
