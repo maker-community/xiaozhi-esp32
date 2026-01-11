@@ -36,28 +36,57 @@ bool SignalRClient::Initialize(const std::string& hub_url, const std::string& to
         return false;
     }
 
-    hub_url_ = hub_url;
+    // 🔐 Build URL with token as query parameter (ASP.NET Core SignalR standard method)
+    // This is the recommended way for WebSocket connections since setting Authorization
+    // header in WebSocket upgrade request requires modifying esp32_websocket_client
+    std::string final_hub_url = hub_url;
+    
+    if (!token.empty()) {
+        ESP_LOGI(TAG, "========== SignalR Token Authentication ==========");
+        ESP_LOGI(TAG, "Token provided: YES");
+        ESP_LOGI(TAG, "Token length: %d characters", token.length());
+        
+        // Remove "Bearer " prefix if present (not needed in query string)
+        std::string token_value = token;
+        if (token_value.find("Bearer ") == 0) {
+            token_value = token_value.substr(7);  // Remove "Bearer "
+            ESP_LOGI(TAG, "Removed 'Bearer ' prefix from token");
+        } else if (token_value.find("bearer ") == 0) {
+            token_value = token_value.substr(7);  // Remove "bearer "
+            ESP_LOGI(TAG, "Removed 'bearer ' prefix from token");
+        }
+        
+        ESP_LOGI(TAG, "Token value length: %d", token_value.length());
+        ESP_LOGI(TAG, "Token preview: %.30s...", token_value.c_str());
+        
+        // Append access_token as query parameter
+        // ASP.NET Core SignalR Hub automatically checks this query parameter
+        char separator = (hub_url.find('?') != std::string::npos) ? '&' : '?';
+        final_hub_url = hub_url + separator + "access_token=" + token_value;
+        
+        ESP_LOGI(TAG, "✓ Token appended to URL as query parameter");
+        ESP_LOGI(TAG, "Final URL format: %s?access_token=...", hub_url.c_str());
+        ESP_LOGI(TAG, "==================================================");
+    } else {
+        ESP_LOGW(TAG, "⚠️ SignalR initialized WITHOUT authentication token");
+        ESP_LOGW(TAG, "Connection will be established without authorization.");
+        ESP_LOGW(TAG, "Server may reject the connection if authentication is required.");
+    }
+
+    hub_url_ = final_hub_url;  // Store the final URL with token
     token_ = token;
 
     try {
         // Create hub connection builder
-        auto builder = signalr::hub_connection_builder::create(hub_url_);
+        auto builder = signalr::hub_connection_builder::create(final_hub_url);
 
         // Set WebSocket factory
-        builder.with_websocket_factory([token = token_](const signalr::signalr_client_config& config) {
+        // Note: Token is already in the URL as query parameter, no need to set headers
+        builder.with_websocket_factory([](const signalr::signalr_client_config& config) {
+            ESP_LOGI(TAG, "[WebSocket Factory] Creating WebSocket client");
+            ESP_LOGI(TAG, "[WebSocket Factory] Token is in URL query string: ?access_token=...");
+            
             auto client = std::make_shared<signalr::esp32_websocket_client>(config);
-            
-            // Add authorization header if token provided
-            if (!token.empty()) {
-                std::string auth_header = token;
-                // Add "Bearer " prefix if not present
-                if (auth_header.find("Bearer ") != 0 && auth_header.find("bearer ") != 0) {
-                    auth_header = "Bearer " + auth_header;
-                }
-                // Note: Header setting depends on esp32_websocket_client implementation
-                // You may need to modify this based on the actual API
-            }
-            
             return client;
         });
 

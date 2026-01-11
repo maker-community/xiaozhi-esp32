@@ -683,26 +683,32 @@ void Application::InitializeSignalR() {
     
     ESP_LOGI(TAG, "SignalR Hub URL: %s", hub_url.c_str());
     
-    // 从 Keycloak 获取 access token
-    Settings keycloak_settings("keycloak", false);
-    std::string server_url = keycloak_settings.GetString("server_url");
-    std::string realm = keycloak_settings.GetString("realm");
-    std::string client_id = keycloak_settings.GetString("client_id");
+    // 直接从 NVS 读取已保存的 access token（不依赖 Keycloak 配置）
+    ESP_LOGI(TAG, "========== Loading Saved Token ==========");
+    Settings token_storage("keycloak", false);
+    std::string token = token_storage.GetString("access_token", "");
+    int64_t expires_at = token_storage.GetInt("access_expires", 0);
     
-    std::string token;
-    if (!server_url.empty() && !realm.empty() && !client_id.empty()) {
-        KeycloakAuth keycloak_auth(server_url, realm, client_id);
-        keycloak_auth.LoadTokens();
+    if (!token.empty()) {
+        // 检查token是否过期
+        struct timeval tv;
+        gettimeofday(&tv, NULL);
+        int64_t now = tv.tv_sec;
         
-        if (keycloak_auth.IsAuthenticated()) {
-            token = keycloak_auth.GetAccessToken();
-            ESP_LOGI(TAG, "Using Keycloak access token for SignalR authentication");
+        if (expires_at > now) {
+            ESP_LOGI(TAG, "✅ Found valid saved token");
+            ESP_LOGI(TAG, "Token length: %d characters", token.length());
+            ESP_LOGI(TAG, "Token expires in: %lld seconds", (long long)(expires_at - now));
         } else {
-            ESP_LOGW(TAG, "Keycloak not authenticated, SignalR will connect without token");
+            ESP_LOGW(TAG, "⚠️ Saved token has expired, clearing...");
+            token.clear();
         }
     } else {
-        ESP_LOGI(TAG, "Keycloak not configured, SignalR will connect without token");
+        ESP_LOGW(TAG, "No saved token found");
+        ESP_LOGW(TAG, "SignalR will connect without token");
+        ESP_LOGW(TAG, "To authenticate: Use MCP keycloak login tool");
     }
+    ESP_LOGI(TAG, "==========================================");
     
     auto& signalr = SignalRClient::GetInstance();
     
