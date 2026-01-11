@@ -7,6 +7,8 @@
 #include <freertos/FreeRTOS.h>
 #include <freertos/task.h>
 #include <chrono>
+#include <sys/time.h>
+#include <algorithm>
 #include "esp32_websocket_client.h"
 #include "esp32_http_client.h"
 #include "signalr_value.h"
@@ -22,7 +24,25 @@ SignalRClient::SignalRClient() {
 }
 
 SignalRClient::~SignalRClient() {
+    // Stop reconnect task first
+    if (reconnect_task_handle_ != nullptr) {
+        reconnect_task_running_.store(false, std::memory_order_release);
+        // Give task time to exit
+        for (int i = 0; i < 50 && reconnect_task_handle_ != nullptr; i++) {
+            vTaskDelay(pdMS_TO_TICKS(20));
+        }
+    }
     Disconnect();
+    
+    // Free PSRAM allocated resources
+    if (reconnect_task_stack_ != nullptr) {
+        heap_caps_free(reconnect_task_stack_);
+        reconnect_task_stack_ = nullptr;
+    }
+    if (reconnect_task_buffer_ != nullptr) {
+        heap_caps_free(reconnect_task_buffer_);
+        reconnect_task_buffer_ = nullptr;
+    }
 }
 
 bool SignalRClient::Initialize(const std::string& hub_url, const std::string& token) {
@@ -320,31 +340,171 @@ bool SignalRClient::Reconnect() {
 
 void SignalRClient::PerformReconnect() {
     // Application-layer reconnection logic.
-    // Called from main loop when polling detects disconnection.
-    // Connect() is non-blocking (starts async connection and returns immediately).
-    
+    // This now delegates to the background task to avoid blocking.
+    RequestReconnect();
+}
+
+void SignalRClient::RequestReconnect() {
+    // Set the reconnect request flag - the background task will pick it up
     if (!initialized_) {
-        ESP_LOGW(TAG, "SignalR not initialized, skipping reconnect");
+        ESP_LOGW(TAG, "SignalR not initialized, skipping reconnect request");
         return;
     }
     
     if (connecting_.load(std::memory_order_acquire)) {
-        ESP_LOGD(TAG, "SignalR already connecting, skipping");
+        ESP_LOGD(TAG, "SignalR already connecting, skipping request");
         return;
     }
     
     if (IsConnected()) {
-        ESP_LOGD(TAG, "SignalR already connected, skipping reconnect");
+        ESP_LOGD(TAG, "SignalR already connected, skipping reconnect request");
         return;
     }
     
-    ESP_LOGI(TAG, "SignalR performing reconnection...");
+    // Set the flag - task will handle the actual connection
+    reconnect_requested_.store(true, std::memory_order_release);
     
-    if (!Connect()) {
-        ESP_LOGW(TAG, "SignalR reconnection failed to start");
-    } else {
-        ESP_LOGI(TAG, "SignalR reconnection initiated");
+    // Start the reconnect task if not running
+    if (reconnect_task_handle_ == nullptr && !reconnect_task_running_.load(std::memory_order_acquire)) {
+        ESP_LOGI(TAG, "Starting SignalR reconnect background task (PSRAM stack)...");
+        reconnect_task_running_.store(true, std::memory_order_release);
+        
+        // Allocate task stack from PSRAM (reusable - only allocate once)
+        if (reconnect_task_stack_ == nullptr) {
+            reconnect_task_stack_ = (StackType_t*)heap_caps_malloc(
+                RECONNECT_TASK_STACK_SIZE, MALLOC_CAP_SPIRAM);
+            if (reconnect_task_stack_ == nullptr) {
+                ESP_LOGE(TAG, "Failed to allocate task stack from PSRAM");
+                reconnect_task_running_.store(false, std::memory_order_release);
+                return;
+            }
+            ESP_LOGI(TAG, "✓ Reconnect task stack allocated from PSRAM (%d bytes)", 
+                     RECONNECT_TASK_STACK_SIZE);
+        }
+        
+        // Allocate task control block from internal RAM (required by FreeRTOS)
+        if (reconnect_task_buffer_ == nullptr) {
+            reconnect_task_buffer_ = (StaticTask_t*)heap_caps_malloc(
+                sizeof(StaticTask_t), MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT);
+            if (reconnect_task_buffer_ == nullptr) {
+                ESP_LOGE(TAG, "Failed to allocate task buffer from internal RAM");
+                reconnect_task_running_.store(false, std::memory_order_release);
+                return;
+            }
+            ESP_LOGI(TAG, "✓ Reconnect task TCB allocated from internal RAM (%d bytes)", 
+                     sizeof(StaticTask_t));
+        }
+        
+        // Create task with static allocation (stack in PSRAM)
+        reconnect_task_handle_ = xTaskCreateStatic(
+            ReconnectTaskEntry,
+            "signalr_reconn",
+            RECONNECT_TASK_STACK_SIZE / sizeof(StackType_t),  // Stack size in words
+            this,
+            2,     // Low priority - don't interfere with audio
+            reconnect_task_stack_,
+            reconnect_task_buffer_
+        );
+        
+        if (reconnect_task_handle_ == nullptr) {
+            ESP_LOGE(TAG, "Failed to create reconnect task");
+            reconnect_task_running_.store(false, std::memory_order_release);
+        } else {
+            ESP_LOGI(TAG, "✓ Reconnect task created on PSRAM stack");
+        }
     }
+}
+
+void SignalRClient::ReconnectTaskEntry(void* arg) {
+    SignalRClient* self = static_cast<SignalRClient*>(arg);
+    self->ReconnectTaskLoop();
+    self->reconnect_task_handle_ = nullptr;
+    vTaskDelete(NULL);
+}
+
+void SignalRClient::ReconnectTaskLoop() {
+    ESP_LOGI(TAG, "SignalR reconnect task started");
+    
+    while (reconnect_task_running_.load(std::memory_order_acquire)) {
+        // Wait for reconnect request or periodic check
+        vTaskDelay(pdMS_TO_TICKS(500));
+        
+        // Check if we should exit
+        if (!reconnect_task_running_.load(std::memory_order_acquire)) {
+            break;
+        }
+        
+        // Check if reconnect was requested
+        if (!reconnect_requested_.load(std::memory_order_acquire)) {
+            // If connected, we can reduce the check frequency
+            if (IsConnected()) {
+                vTaskDelay(pdMS_TO_TICKS(2000));  // Check every 2.5 seconds when connected
+            }
+            continue;
+        }
+        
+        // Clear the request flag
+        reconnect_requested_.store(false, std::memory_order_release);
+        
+        // Check preconditions again
+        if (!initialized_) {
+            ESP_LOGW(TAG, "SignalR not initialized, stopping reconnect task");
+            break;
+        }
+        
+        if (connecting_.load(std::memory_order_acquire)) {
+            ESP_LOGD(TAG, "Already connecting, will retry later");
+            continue;
+        }
+        
+        if (IsConnected()) {
+            ESP_LOGD(TAG, "Already connected, resetting backoff");
+            reconnect_backoff_ms_ = 1000;  // Reset backoff on successful connection
+            continue;
+        }
+        
+        // Check backoff timing
+        struct timeval tv;
+        gettimeofday(&tv, NULL);
+        int64_t now_ms = (int64_t)tv.tv_sec * 1000 + tv.tv_usec / 1000;
+        int64_t elapsed = now_ms - last_reconnect_attempt_time_;
+        
+        if (elapsed < MIN_RECONNECT_INTERVAL_MS) {
+            ESP_LOGD(TAG, "Too soon since last attempt, waiting %lld ms more", 
+                     (long long)(MIN_RECONNECT_INTERVAL_MS - elapsed));
+            vTaskDelay(pdMS_TO_TICKS(MIN_RECONNECT_INTERVAL_MS - elapsed));
+        }
+        
+        // Update attempt time
+        gettimeofday(&tv, NULL);
+        last_reconnect_attempt_time_ = (int64_t)tv.tv_sec * 1000 + tv.tv_usec / 1000;
+        
+        ESP_LOGI(TAG, "SignalR reconnect task: attempting connection (backoff=%dms)...", 
+                 reconnect_backoff_ms_);
+        
+        // Attempt connection - this will block until connected or timeout
+        bool success = Connect();
+        
+        // Wait a bit for connection to establish
+        vTaskDelay(pdMS_TO_TICKS(200));
+        
+        if (IsConnected()) {
+            ESP_LOGI(TAG, "SignalR reconnect task: connection successful!");
+            reconnect_backoff_ms_ = 1000;  // Reset backoff
+        } else {
+            ESP_LOGW(TAG, "SignalR reconnect task: connection failed, backing off %dms", 
+                     reconnect_backoff_ms_);
+            // Apply backoff delay
+            vTaskDelay(pdMS_TO_TICKS(reconnect_backoff_ms_));
+            // Increase backoff for next attempt
+            reconnect_backoff_ms_ = std::min(reconnect_backoff_ms_ * 2, MAX_RECONNECT_BACKOFF_MS);
+            // Request another attempt
+            reconnect_requested_.store(true, std::memory_order_release);
+        }
+    }
+    
+    ESP_LOGI(TAG, "SignalR reconnect task exiting");
+    reconnect_task_running_.store(false, std::memory_order_release);
 }
 
 bool SignalRClient::IsInitialized() const {

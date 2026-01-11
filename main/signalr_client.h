@@ -114,8 +114,15 @@ public:
     /**
      * Attempt reconnection if not connected
      * Safe to call repeatedly - will skip if already connected or connecting
+     * NOTE: This now runs in a background task and returns immediately (non-blocking)
      */
     void PerformReconnect();
+
+    /**
+     * Request a reconnection attempt via background task
+     * This is completely non-blocking and safe to call from any context
+     */
+    void RequestReconnect();
 
 private:
     SignalRClient();
@@ -127,6 +134,21 @@ private:
     bool initialized_ = false;
     bool connection_confirmed_ = false;  // Set true when server sends Notification
     std::atomic<bool> connecting_{false};
+    std::atomic<bool> reconnect_requested_{false};  // Flag for async reconnect request
+    
+    // Background reconnection task (uses PSRAM for stack to save internal RAM)
+    TaskHandle_t reconnect_task_handle_ = nullptr;
+    StackType_t* reconnect_task_stack_ = nullptr;      // Task stack in PSRAM
+    StaticTask_t* reconnect_task_buffer_ = nullptr;    // Task TCB in internal RAM
+    std::atomic<bool> reconnect_task_running_{false};
+    int64_t last_reconnect_attempt_time_ = 0;  // For backoff timing
+    int reconnect_backoff_ms_ = 1000;  // Initial backoff delay
+    static constexpr int MAX_RECONNECT_BACKOFF_MS = 30000;  // Max 30 seconds
+    static constexpr int MIN_RECONNECT_INTERVAL_MS = 5000;  // Minimum 5 seconds between attempts
+    static constexpr size_t RECONNECT_TASK_STACK_SIZE = 8192;  // 8KB stack in PSRAM (Connect() needs more stack)
+    
+    static void ReconnectTaskEntry(void* arg);
+    void ReconnectTaskLoop();
     
     std::function<void(const cJSON*)> on_custom_message_;
     std::function<void(bool, const std::string&)> on_connection_state_changed_;
@@ -153,6 +175,7 @@ public:
     bool IsConnected() const { return false; }
     bool IsConnecting() const { return false; }
     void PerformReconnect() {}
+    void RequestReconnect() {}
     std::string GetConnectionState() const { return "disabled"; }
     void OnCustomMessage(std::function<void(const cJSON*)>) {}
     void OnConnectionStateChanged(std::function<void(bool, const std::string&)>) {}

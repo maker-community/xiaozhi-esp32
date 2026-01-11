@@ -263,8 +263,8 @@ void Application::Run() {
             }
 
 #ifdef CONFIG_ENABLE_SIGNALR_CLIENT
-            // Check if SignalR needs reconnection (pure polling approach)
-            // Only reconnect when device is IDLE to avoid blocking audio processing
+            // Check if SignalR needs reconnection (non-blocking async approach)
+            // The reconnection runs in a background task, so this is always safe to call
             {
                 static int signalr_disconnect_detect_count = 0;
                 auto& signalr = SignalRClient::GetInstance();
@@ -293,10 +293,9 @@ void Application::Run() {
                             // Wait for 2 consecutive checks (2 seconds) to confirm disconnect
                             if (signalr_disconnect_detect_count >= 2) {
                                 signalr_disconnect_detect_count = 0;
-                                // Only attempt reconnection when device is idle
-                                if (GetDeviceState() == kDeviceStateIdle) {
-                                    signalr.PerformReconnect();
-                                }
+                                // Request reconnection - this is non-blocking (runs in background task)
+                                // No need to check device state since it doesn't block audio processing
+                                signalr.RequestReconnect();
                             }
                         } else {
                             // Reset counter when connected or connecting
