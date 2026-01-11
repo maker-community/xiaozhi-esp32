@@ -130,10 +130,12 @@ bool SignalRClient::Initialize(const std::string& hub_url, const std::string& to
                  (unsigned long)heap_caps_get_free_size(MALLOC_CAP_SPIRAM));
 
         // Tune timeouts to reduce false disconnects
+        // NOTE: When server is unreachable, total wait = WebSocket timeout + handshake timeout
+        // Keep these short to avoid blocking too long during reconnection attempts
         signalr::signalr_client_config cfg;
         cfg.set_server_timeout(std::chrono::seconds(60));     // server expects 60s idle before dropping
         cfg.set_keepalive_interval(std::chrono::seconds(15));  // send ping every 15s
-        cfg.set_handshake_timeout(std::chrono::seconds(30));   // generous handshake
+        cfg.set_handshake_timeout(std::chrono::seconds(5));    // short handshake timeout (matches WebSocket timeout)
         
         // IMPORTANT: Disable library's auto-reconnect! It has race condition bugs that cause crashes.
         // We use our own application-layer reconnection logic via needs_reconnect_ flag instead.
