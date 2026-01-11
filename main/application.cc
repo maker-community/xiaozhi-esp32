@@ -263,28 +263,28 @@ void Application::Run() {
             }
 
 #ifdef CONFIG_ENABLE_SIGNALR_CLIENT
-            // Check if SignalR needs reconnection (application-layer reconnect)
-            // IMPORTANT: Only reconnect when device is IDLE to avoid blocking audio processing!
-            // PerformReconnect() is a blocking call that can take several seconds.
+            // Check if SignalR needs reconnection (pure polling approach)
+            // Only reconnect when device is IDLE to avoid blocking audio processing
             {
-                auto& signalr = SignalRClient::GetInstance();
-                if (signalr.IsInitialized() && signalr.NeedsReconnect()) {
-                    // Only attempt reconnection when device is idle
-                    auto state = GetDeviceState();
-                    if (state == kDeviceStateIdle) {
-                        signalr.PerformReconnect();
-                    }
-                    // If not idle, the reconnect will be attempted on next loop when device becomes idle
-                }
-            }
-            
-            // Log SignalR connection status every 30 seconds for debugging
-            if (clock_ticks_ % 30 == 0) {
+                static int signalr_disconnect_detect_count = 0;
                 auto& signalr = SignalRClient::GetInstance();
                 if (signalr.IsInitialized()) {
-                    ESP_LOGD(TAG, "SignalR status: connected=%d, state=%s", 
-                             signalr.IsConnected() ? 1 : 0, 
-                             signalr.GetConnectionState().c_str());
+                    // Pure polling: check if disconnected and not currently connecting
+                    if (!signalr.IsConnected() && !signalr.IsConnecting()) {
+                        signalr_disconnect_detect_count++;
+                        // Wait for 2 consecutive checks (2 seconds) to confirm disconnect
+                        // Reduced from 3 to 2 since we no longer have callback notification
+                        if (signalr_disconnect_detect_count >= 2) {
+                            signalr_disconnect_detect_count = 0;
+                            // Only attempt reconnection when device is idle
+                            if (GetDeviceState() == kDeviceStateIdle) {
+                                signalr.PerformReconnect();
+                            }
+                        }
+                    } else {
+                        // Reset counter when connected or connecting
+                        signalr_disconnect_detect_count = 0;
+                    }
                 }
             }
 #endif
@@ -312,15 +312,11 @@ void Application::HandleNetworkConnectedEvent() {
         }, "activation", 4096 * 2, this, 2, &activation_task_handle_);
     } else {
 #ifdef CONFIG_ENABLE_SIGNALR_CLIENT
-        // Network restored - SignalR's internal auto-reconnect will handle this
-        // Just re-enable the flag so it can attempt reconnection in its own task
+        // Network restored - polling will detect disconnect and reconnect automatically
         auto& signalr = SignalRClient::GetInstance();
-        if (signalr.IsInitialized()) {
-            signalr.SetAutoReconnectEnabled(true);
-            ESP_LOGI(TAG, "Network restored, SignalR auto-reconnect enabled (state=%s)", 
+        if (signalr.IsInitialized() && !signalr.IsConnected()) {
+            ESP_LOGI(TAG, "Network restored, SignalR will reconnect via polling (state=%s)", 
                      signalr.GetConnectionState().c_str());
-            // The library's internal reconnection logic runs in a separate task
-            // and won't block voice call functionality
         }
 #endif
     }
@@ -339,11 +335,11 @@ void Application::HandleNetworkDisconnectedEvent() {
     }
 
 #ifdef CONFIG_ENABLE_SIGNALR_CLIENT
-    // Disable auto-reconnect and disconnect SignalR when network is lost
+    // Disconnect SignalR when network is lost
+    // Polling will not reconnect while network is down (IsConnecting check prevents rapid retries)
     auto& signalr = SignalRClient::GetInstance();
     if (signalr.IsInitialized()) {
         ESP_LOGI(TAG, "Disconnecting SignalR due to network loss");
-        signalr.SetAutoReconnectEnabled(false);  // Disable reconnect attempts while network is down
         signalr.Disconnect();
     }
 #endif

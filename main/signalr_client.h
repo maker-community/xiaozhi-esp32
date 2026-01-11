@@ -85,12 +85,6 @@ public:
     void OnConnectionStateChanged(std::function<void(bool connected, const std::string& error)> callback);
 
     /**
-     * Get the last connection error message
-     * Safe to call from any context
-     */
-    std::string GetLastConnectionError() const;
-
-    /**
      * Invoke a hub method with arguments
      * @param method_name The hub method name to invoke
      * @param args JSON array string of arguments (e.g., "[\"arg1\", 123]")
@@ -107,21 +101,15 @@ public:
     void SendHubMessage(const std::string& method_name, const std::string& args_json = "[]");
 
     /**
-     * Check if reconnection is needed (connection was lost)
-     * Call this periodically from main loop
+     * Check if connection attempt is currently in progress
      */
-    bool NeedsReconnect() const;
+    bool IsConnecting() const;
 
     /**
-     * Perform full reconnection (stop + connect)
-     * Should be called from main loop when NeedsReconnect() returns true
+     * Attempt reconnection if not connected
+     * Safe to call repeatedly - will skip if already connected or connecting
      */
     void PerformReconnect();
-
-    /**
-     * Enable or disable auto-reconnect flag checking
-     */
-    void SetAutoReconnectEnabled(bool enabled);
 
 private:
     SignalRClient();
@@ -132,10 +120,6 @@ private:
     std::string token_;
     bool initialized_ = false;
     bool connection_confirmed_ = false;  // Set true when server sends Notification
-    std::atomic<bool> connection_lost_{false};
-    std::atomic<bool> needs_reconnect_{false};
-    std::atomic<bool> auto_reconnect_enabled_{true};
-    std::string last_error_;
     std::atomic<bool> connecting_{false};
     
     std::function<void(const cJSON*)> on_custom_message_;
@@ -160,9 +144,8 @@ public:
     bool Reconnect() { return false; }
     bool IsInitialized() const { return false; }
     bool IsConnected() const { return false; }
-    bool NeedsReconnect() const { return false; }
+    bool IsConnecting() const { return false; }
     void PerformReconnect() {}
-    void SetAutoReconnectEnabled(bool) {}
     std::string GetConnectionState() const { return "disabled"; }
     void OnCustomMessage(std::function<void(const cJSON*)>) {}
     void OnConnectionStateChanged(std::function<void(bool, const std::string&)>) {}

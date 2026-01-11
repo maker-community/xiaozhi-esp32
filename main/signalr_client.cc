@@ -93,21 +93,15 @@ bool SignalRClient::Initialize(const std::string& hub_url, const std::string& to
         
         connection_->set_client_config(cfg);
 
-        // Set disconnected callback to detect connection loss
-        // Only set atomic flag here to avoid deadlock - actual reconnect happens in main loop
-        connection_->set_disconnected([this](std::exception_ptr ex) {
-            ESP_LOGW(TAG, "SignalR disconnected callback triggered, auto_reconnect=%d", 
-                     auto_reconnect_enabled_.load(std::memory_order_acquire) ? 1 : 0);
-            if (auto_reconnect_enabled_.load(std::memory_order_acquire)) {
-                needs_reconnect_.store(true, std::memory_order_release);
-                ESP_LOGI(TAG, "SignalR reconnect flag set");
-                if (ex) {
-                    try {
-                        std::rethrow_exception(ex);
-                    } catch (const std::exception& e) {
-                        ESP_LOGW(TAG, "SignalR disconnect reason: %s", e.what());
-                        last_error_ = e.what();
-                    }
+        // Set disconnected callback - just log for debugging
+        // Actual reconnect is handled by application-layer polling (checks IsConnected periodically)
+        connection_->set_disconnected([](std::exception_ptr ex) {
+            ESP_LOGW(TAG, "SignalR disconnected callback triggered");
+            if (ex) {
+                try {
+                    std::rethrow_exception(ex);
+                } catch (const std::exception& e) {
+                    ESP_LOGW(TAG, "SignalR disconnect reason: %s", e.what());
                 }
             }
         });
@@ -194,8 +188,6 @@ bool SignalRClient::Connect() {
                  (unsigned long)heap_caps_get_free_size(MALLOC_CAP_SPIRAM),
                  (unsigned long)heap_caps_get_minimum_free_size(MALLOC_CAP_INTERNAL));
         
-        connection_lost_.store(false, std::memory_order_release);
-        last_error_.clear();
         connecting_.store(true, std::memory_order_release);
         
         // Provide empty callback to satisfy API - keep work minimal to avoid deadlock
@@ -205,7 +197,7 @@ bool SignalRClient::Connect() {
                 try {
                     std::rethrow_exception(ex);
                 } catch (const std::exception& e) {
-                    last_error_ = e.what();
+                    ESP_LOGE(TAG, "Connection failed: %s", e.what());
                 }
             }
         });
@@ -269,21 +261,10 @@ bool SignalRClient::Reconnect() {
     return Connect();
 }
 
-bool SignalRClient::NeedsReconnect() const {
-    return needs_reconnect_.load(std::memory_order_acquire);
-}
-
 void SignalRClient::PerformReconnect() {
     // Application-layer reconnection logic.
-    // This is called from the main application loop when NeedsReconnect() returns true.
-    // IMPORTANT: This method blocks! Only call when device is idle to avoid audio issues.
-    
-    if (!needs_reconnect_.load(std::memory_order_acquire)) {
-        return;
-    }
-    
-    // Clear the flag first to prevent multiple reconnect attempts
-    needs_reconnect_.store(false, std::memory_order_release);
+    // Called from main loop when polling detects disconnection.
+    // Connect() is non-blocking (starts async connection and returns immediately).
     
     if (!initialized_) {
         ESP_LOGW(TAG, "SignalR not initialized, skipping reconnect");
@@ -291,42 +272,36 @@ void SignalRClient::PerformReconnect() {
     }
     
     if (connecting_.load(std::memory_order_acquire)) {
-        ESP_LOGW(TAG, "SignalR already connecting, skipping");
+        ESP_LOGD(TAG, "SignalR already connecting, skipping");
         return;
     }
     
-    // Check if already connected
     if (IsConnected()) {
-        ESP_LOGI(TAG, "SignalR already connected, skipping reconnect");
+        ESP_LOGD(TAG, "SignalR already connected, skipping reconnect");
         return;
     }
     
-    // Perform the actual reconnection
-    ESP_LOGI(TAG, "SignalR performing application-layer reconnection (device is idle)...");
+    ESP_LOGI(TAG, "SignalR performing reconnection...");
     
-    // Short delay before reconnecting - just enough to avoid rapid retries
-    // Reduced from 2000ms to 500ms since we only reconnect when idle
-    vTaskDelay(pdMS_TO_TICKS(500));
-    
-    // Attempt to connect
     if (!Connect()) {
-        ESP_LOGW(TAG, "SignalR reconnection failed, will retry when idle again");
-        // Set the flag again so we retry on next poll when device is idle
-        needs_reconnect_.store(true, std::memory_order_release);
+        ESP_LOGW(TAG, "SignalR reconnection failed to start");
     } else {
-        ESP_LOGI(TAG, "SignalR reconnection initiated successfully");
-    }
-}
-
-void SignalRClient::SetAutoReconnectEnabled(bool enabled) {
-    auto_reconnect_enabled_.store(enabled, std::memory_order_release);
-    if (!enabled) {
-        needs_reconnect_.store(false, std::memory_order_release);
+        ESP_LOGI(TAG, "SignalR reconnection initiated");
     }
 }
 
 bool SignalRClient::IsInitialized() const {
     return initialized_;
+}
+
+bool SignalRClient::IsConnecting() const {
+    if (connecting_.load(std::memory_order_acquire)) {
+        return true;
+    }
+    if (!connection_) {
+        return false;
+    }
+    return connection_->get_connection_state() == signalr::connection_state::connecting;
 }
 
 bool SignalRClient::IsConnected() const {
@@ -361,10 +336,6 @@ void SignalRClient::OnCustomMessage(std::function<void(const cJSON*)> callback) 
 void SignalRClient::OnConnectionStateChanged(
     std::function<void(bool connected, const std::string& error)> callback) {
     on_connection_state_changed_ = callback;
-}
-
-std::string SignalRClient::GetLastConnectionError() const {
-    return last_error_;
 }
 
 void SignalRClient::InvokeHubMethod(const std::string& method_name, 
