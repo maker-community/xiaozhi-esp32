@@ -109,4 +109,4 @@ dependencies:
   idf:
     version: '>=5.4.0'
   espressif/esp_lcd_touch_st7123: ^1.0.0
-  verdure/esp-signalr: ^1.0.3
+  verdure/esp-signalr: ^1.0.4
