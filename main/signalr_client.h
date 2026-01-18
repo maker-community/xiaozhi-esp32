@@ -91,6 +91,32 @@ public:
     void OnConnectionStateChanged(std::function<void(bool connected, const std::string& error)> callback);
 
     /**
+     * Register a handler for device registration confirmation from server
+     * Handler receives parsed JSON with deviceId, macAddress, status, timestamp
+     */
+    void OnDeviceRegistered(std::function<void(const cJSON*)> callback);
+
+    /**
+     * Register this device with the server
+     * Should be called after connection is established
+     * @param mac_address Device MAC address (unique identifier)
+     * @param device_token Optional device-specific token
+     * @param metadata Optional JSON metadata (firmware version, type, etc.)
+     * @param callback Optional callback for registration result
+     */
+    void RegisterDevice(const std::string& mac_address, 
+                       const std::string& device_token = "",
+                       const std::string& metadata = "",
+                       std::function<void(bool success, const std::string& result)> callback = nullptr);
+
+    /**
+     * Send heartbeat to server to maintain connection status
+     * Should be called periodically (e.g., every 30 seconds)
+     * @param callback Optional callback for heartbeat result
+     */
+    void SendHeartbeat(std::function<void(bool success, const std::string& result)> callback = nullptr);
+
+    /**
      * Invoke a hub method with arguments
      * @param method_name The hub method name to invoke
      * @param args JSON array string of arguments (e.g., "[\"arg1\", 123]")
@@ -152,6 +178,7 @@ private:
     
     std::function<void(const cJSON*)> on_custom_message_;
     std::function<void(bool, const std::string&)> on_connection_state_changed_;
+    std::function<void(const cJSON*)> on_device_registered_;
 
     // Helper to parse JSON array string to signalr::value vector
     std::vector<signalr::value> ParseJsonArray(const std::string& json_str);
@@ -179,6 +206,10 @@ public:
     std::string GetConnectionState() const { return "disabled"; }
     void OnCustomMessage(std::function<void(const cJSON*)>) {}
     void OnConnectionStateChanged(std::function<void(bool, const std::string&)>) {}
+    void OnDeviceRegistered(std::function<void(const cJSON*)>) {}
+    void RegisterDevice(const std::string&, const std::string& = "", const std::string& = "",
+                       std::function<void(bool, const std::string&)> = nullptr) {}
+    void SendHeartbeat(std::function<void(bool, const std::string&)> = nullptr) {}
     void InvokeHubMethod(const std::string&, const std::string& = "[]",
                         std::function<void(bool, const std::string&)> = nullptr) {}
     void SendHubMessage(const std::string&, const std::string& = "[]") {}

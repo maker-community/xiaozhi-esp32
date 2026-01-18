@@ -207,6 +207,34 @@ bool SignalRClient::Initialize(const std::string& hub_url, const std::string& to
             }
         });
 
+        // Register handler for "DeviceRegistered" confirmation from server
+        connection_->on("DeviceRegistered", [this](const std::vector<signalr::value>& args) {
+            if (args.empty()) {
+                ESP_LOGW(TAG, "Received empty DeviceRegistered");
+                return;
+            }
+
+            try {
+                // Parse the first argument as JSON string or object
+                std::string json_str = args[0].as_string();
+                ESP_LOGI(TAG, "✅ Device registration confirmed: %s", json_str.c_str());
+
+                auto root = cJSON_Parse(json_str.c_str());
+                if (root) {
+                    if (on_device_registered_) {
+                        on_device_registered_(root);
+                    } else {
+                        ESP_LOGI(TAG, "DeviceRegistered callback not set (using default logging)");
+                    }
+                    cJSON_Delete(root);
+                } else {
+                    ESP_LOGE(TAG, "Failed to parse DeviceRegistered JSON");
+                }
+            } catch (const std::exception& e) {
+                ESP_LOGE(TAG, "Exception handling DeviceRegistered: %s", e.what());
+            }
+        });
+
         initialized_ = true;
         ESP_LOGI(TAG, "SignalR client initialized with URL: %s", hub_url_.c_str());
         ESP_LOGI(TAG, "Memory after init: internal=%lu, PSRAM=%lu",
@@ -314,6 +342,7 @@ void SignalRClient::Reset() {
     // Clear callbacks (optional, but ensures clean state)
     on_custom_message_ = nullptr;
     on_connection_state_changed_ = nullptr;
+    on_device_registered_ = nullptr;
     
     ESP_LOGI(TAG, "SignalR client reset complete - can be re-initialized");
 }
@@ -555,6 +584,114 @@ void SignalRClient::OnCustomMessage(std::function<void(const cJSON*)> callback) 
 void SignalRClient::OnConnectionStateChanged(
     std::function<void(bool connected, const std::string& error)> callback) {
     on_connection_state_changed_ = callback;
+}
+
+void SignalRClient::OnDeviceRegistered(std::function<void(const cJSON*)> callback) {
+    on_device_registered_ = callback;
+    ESP_LOGI(TAG, "DeviceRegistered callback registered");
+}
+
+void SignalRClient::RegisterDevice(const std::string& mac_address,
+                                   const std::string& device_token,
+                                   const std::string& metadata,
+                                   std::function<void(bool success, const std::string& result)> callback) {
+    if (!connection_ || !IsConnected()) {
+        ESP_LOGE(TAG, "Cannot register device: not connected");
+        if (callback) {
+            callback(false, "Not connected");
+        }
+        return;
+    }
+
+    if (mac_address.empty()) {
+        ESP_LOGE(TAG, "MAC address is required for device registration");
+        if (callback) {
+            callback(false, "MAC address is required");
+        }
+        return;
+    }
+
+    ESP_LOGI(TAG, "Registering device with server...");
+    ESP_LOGI(TAG, "  MAC Address: %s", mac_address.c_str());
+    if (!device_token.empty()) {
+        ESP_LOGI(TAG, "  Device Token: %.20s...", device_token.c_str());
+    }
+    if (!metadata.empty()) {
+        ESP_LOGI(TAG, "  Metadata: %s", metadata.c_str());
+    }
+
+    try {
+        // Build arguments array: [macAddress, deviceToken, metadata]
+        std::vector<signalr::value> args;
+        args.push_back(signalr::value(mac_address));
+        args.push_back(signalr::value(device_token.empty() ? "" : device_token));
+        args.push_back(signalr::value(metadata.empty() ? "" : metadata));
+
+        connection_->invoke("RegisterDevice", args,
+            [callback](const signalr::value& result, std::exception_ptr ex) {
+                if (ex) {
+                    try {
+                        std::rethrow_exception(ex);
+                    } catch (const std::exception& e) {
+                        ESP_LOGE(TAG, "RegisterDevice failed: %s", e.what());
+                        if (callback) {
+                            callback(false, e.what());
+                        }
+                    }
+                } else {
+                    ESP_LOGI(TAG, "✓ Device registration request sent successfully");
+                    if (callback) {
+                        callback(true, "Registration sent");
+                    }
+                }
+            });
+
+    } catch (const std::exception& e) {
+        ESP_LOGE(TAG, "Exception calling RegisterDevice: %s", e.what());
+        if (callback) {
+            callback(false, e.what());
+        }
+    }
+}
+
+void SignalRClient::SendHeartbeat(std::function<void(bool success, const std::string& result)> callback) {
+    if (!connection_ || !IsConnected()) {
+        ESP_LOGD(TAG, "Cannot send heartbeat: not connected");
+        if (callback) {
+            callback(false, "Not connected");
+        }
+        return;
+    }
+
+    try {
+        // Call Heartbeat hub method (no parameters)
+        std::vector<signalr::value> args;  // Empty args
+
+        connection_->invoke("Heartbeat", args,
+            [callback](const signalr::value& result, std::exception_ptr ex) {
+                if (ex) {
+                    try {
+                        std::rethrow_exception(ex);
+                    } catch (const std::exception& e) {
+                        ESP_LOGW(TAG, "Heartbeat failed: %s", e.what());
+                        if (callback) {
+                            callback(false, e.what());
+                        }
+                    }
+                } else {
+                    ESP_LOGD(TAG, "💓 Heartbeat sent");
+                    if (callback) {
+                        callback(true, "Heartbeat sent");
+                    }
+                }
+            });
+
+    } catch (const std::exception& e) {
+        ESP_LOGW(TAG, "Exception sending heartbeat: %s", e.what());
+        if (callback) {
+            callback(false, e.what());
+        }
+    }
 }
 
 void SignalRClient::InvokeHubMethod(const std::string& method_name, 
