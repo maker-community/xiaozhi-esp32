@@ -396,11 +396,28 @@ void LcdDisplay::SetupUI() {
     lv_obj_set_flex_align(top_bar_, LV_FLEX_ALIGN_SPACE_BETWEEN, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
     lv_obj_set_scrollbar_mode(top_bar_, LV_SCROLLBAR_MODE_OFF);
 
-    // Left icon
-    network_label_ = lv_label_create(top_bar_);
+    // Left icons container - for network and signalr icons
+    lv_obj_t* left_icons = lv_obj_create(top_bar_);
+    lv_obj_set_size(left_icons, LV_SIZE_CONTENT, LV_SIZE_CONTENT);
+    lv_obj_set_style_bg_opa(left_icons, LV_OPA_TRANSP, 0);
+    lv_obj_set_style_border_width(left_icons, 0, 0);
+    lv_obj_set_style_pad_all(left_icons, 0, 0);
+    lv_obj_set_flex_flow(left_icons, LV_FLEX_FLOW_ROW);
+    lv_obj_set_flex_align(left_icons, LV_FLEX_ALIGN_START, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
+
+    network_label_ = lv_label_create(left_icons);
     lv_label_set_text(network_label_, "");
     lv_obj_set_style_text_font(network_label_, icon_font, 0);
     lv_obj_set_style_text_color(network_label_, lvgl_theme->text_color(), 0);
+
+#ifdef CONFIG_ENABLE_SIGNALR_CLIENT
+    // SignalR connection status indicator - right after network icon
+    signalr_label_ = lv_label_create(left_icons);
+    lv_label_set_text(signalr_label_, "");
+    lv_obj_set_style_text_font(signalr_label_, icon_font, 0);
+    lv_obj_set_style_text_color(signalr_label_, lvgl_theme->text_color(), 0);
+    lv_obj_set_style_margin_left(signalr_label_, lvgl_theme->spacing(2), 0);
+#endif
 
     // Right icons container
     lv_obj_t* right_icons = lv_obj_create(top_bar_);
@@ -415,15 +432,6 @@ void LcdDisplay::SetupUI() {
     lv_label_set_text(mute_label_, "");
     lv_obj_set_style_text_font(mute_label_, icon_font, 0);
     lv_obj_set_style_text_color(mute_label_, lvgl_theme->text_color(), 0);
-
-#ifdef CONFIG_ENABLE_SIGNALR_CLIENT
-    // SignalR connection status indicator
-    signalr_label_ = lv_label_create(right_icons);
-    lv_label_set_text(signalr_label_, "");
-    lv_obj_set_style_text_font(signalr_label_, icon_font, 0);
-    lv_obj_set_style_text_color(signalr_label_, lvgl_theme->text_color(), 0);
-    lv_obj_set_style_margin_left(signalr_label_, lvgl_theme->spacing(2), 0);
-#endif
 
     battery_label_ = lv_label_create(right_icons);
     lv_label_set_text(battery_label_, "");
@@ -841,11 +849,28 @@ void LcdDisplay::SetupUI() {
     lv_obj_set_scrollbar_mode(top_bar_, LV_SCROLLBAR_MODE_OFF);
     lv_obj_align(top_bar_, LV_ALIGN_TOP_MID, 0, 0);
 
-    // Left icon
-    network_label_ = lv_label_create(top_bar_);
+    // Left icons container - for network and signalr icons
+    lv_obj_t* left_icons = lv_obj_create(top_bar_);
+    lv_obj_set_size(left_icons, LV_SIZE_CONTENT, LV_SIZE_CONTENT);
+    lv_obj_set_style_bg_opa(left_icons, LV_OPA_TRANSP, 0);
+    lv_obj_set_style_border_width(left_icons, 0, 0);
+    lv_obj_set_style_pad_all(left_icons, 0, 0);
+    lv_obj_set_flex_flow(left_icons, LV_FLEX_FLOW_ROW);
+    lv_obj_set_flex_align(left_icons, LV_FLEX_ALIGN_START, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
+
+    network_label_ = lv_label_create(left_icons);
     lv_label_set_text(network_label_, "");
     lv_obj_set_style_text_font(network_label_, icon_font, 0);
     lv_obj_set_style_text_color(network_label_, lvgl_theme->text_color(), 0);
+
+#ifdef CONFIG_ENABLE_SIGNALR_CLIENT
+    // SignalR connection status indicator - right after network icon
+    signalr_label_ = lv_label_create(left_icons);
+    lv_label_set_text(signalr_label_, "");
+    lv_obj_set_style_text_font(signalr_label_, icon_font, 0);
+    lv_obj_set_style_text_color(signalr_label_, lvgl_theme->text_color(), 0);
+    lv_obj_set_style_margin_left(signalr_label_, lvgl_theme->spacing(2), 0);
+#endif
 
     // Right icons container
     lv_obj_t* right_icons = lv_obj_create(top_bar_);
@@ -860,15 +885,6 @@ void LcdDisplay::SetupUI() {
     lv_label_set_text(mute_label_, "");
     lv_obj_set_style_text_font(mute_label_, icon_font, 0);
     lv_obj_set_style_text_color(mute_label_, lvgl_theme->text_color(), 0);
-
-#ifdef CONFIG_ENABLE_SIGNALR_CLIENT
-    // SignalR connection status indicator
-    signalr_label_ = lv_label_create(right_icons);
-    lv_label_set_text(signalr_label_, "");
-    lv_obj_set_style_text_font(signalr_label_, icon_font, 0);
-    lv_obj_set_style_text_color(signalr_label_, lvgl_theme->text_color(), 0);
-    lv_obj_set_style_margin_left(signalr_label_, lvgl_theme->spacing(2), 0);
-#endif
 
     battery_label_ = lv_label_create(right_icons);
     lv_label_set_text(battery_label_, "");

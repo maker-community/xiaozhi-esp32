@@ -223,10 +223,14 @@ void LvglDisplay::UpdateStatusBar(bool update_all) {
         const char* signalr_icon = nullptr;
         lv_color_t icon_color = lv_color_hex(0xFFFFFF);  // Default white
         
-        if (signalr.IsConnected()) {
+        bool is_connected = signalr.IsConnected();
+        bool is_initialized = signalr.IsInitialized();
+        
+        // Determine icon based on actual connection state
+        if (is_connected) {
             signalr_icon = FONT_AWESOME_CIRCLE_CHECK;
             icon_color = lv_color_hex(0x00FF00);  // Green
-        } else if (signalr.IsInitialized()) {
+        } else if (is_initialized) {
             signalr_icon = FONT_AWESOME_CIRCLE_XMARK;
             icon_color = lv_color_hex(0xFF0000);  // Red
         } else {
@@ -238,9 +242,14 @@ void LvglDisplay::UpdateStatusBar(bool update_all) {
             DisplayLockGuard lock(this);
             signalr_icon_ = signalr_icon;
             lv_label_set_text(signalr_label_, signalr_icon_);
+            
             if (strlen(signalr_icon) > 0) {  // Only set color if icon is visible
                 lv_obj_set_style_text_color(signalr_label_, icon_color, 0);
             }
+            
+            ESP_LOGI(TAG, "SignalR status updated: %s (connected=%d, initialized=%d)",
+                     is_connected ? "Connected" : (is_initialized ? "Disconnected" : "Hidden"),
+                     is_connected, is_initialized);
         }
     }
 #endif

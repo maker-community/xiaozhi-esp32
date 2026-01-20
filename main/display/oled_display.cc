@@ -188,6 +188,14 @@ void OledDisplay::SetupUI_128x64() {
     lv_label_set_text(network_label_, "");
     lv_obj_set_style_text_font(network_label_, icon_font, 0);
 
+#ifdef CONFIG_ENABLE_SIGNALR_CLIENT
+    // SignalR connection status indicator - placed right after network icon
+    signalr_label_ = lv_label_create(top_bar_);
+    lv_label_set_text(signalr_label_, "");
+    lv_obj_set_style_text_font(signalr_label_, icon_font, 0);
+    lv_obj_set_style_margin_left(signalr_label_, 4, 0);  // Add small spacing from network icon
+#endif
+
     lv_obj_t* right_icons = lv_obj_create(top_bar_);
     lv_obj_set_size(right_icons, LV_SIZE_CONTENT, LV_SIZE_CONTENT);
     lv_obj_set_style_bg_opa(right_icons, LV_OPA_TRANSP, 0);
@@ -199,14 +207,6 @@ void OledDisplay::SetupUI_128x64() {
     mute_label_ = lv_label_create(right_icons);
     lv_label_set_text(mute_label_, "");
     lv_obj_set_style_text_font(mute_label_, icon_font, 0);
-
-#ifdef CONFIG_ENABLE_SIGNALR_CLIENT
-    // SignalR connection status indicator
-    signalr_label_ = lv_label_create(right_icons);
-    lv_label_set_text(signalr_label_, "");
-    lv_obj_set_style_text_font(signalr_label_, icon_font, 0);
-    ESP_LOGI("OledDisplay", "SignalR label created: %p", signalr_label_);
-#endif
 
     battery_label_ = lv_label_create(right_icons);
     lv_label_set_text(battery_label_, "");
