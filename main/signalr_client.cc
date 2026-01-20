@@ -12,6 +12,7 @@
 #include "esp32_websocket_client.h"
 #include "esp32_http_client.h"
 #include "signalr_value.h"
+#include "device_info.h"
 
 #define TAG "SignalRClient"
 
@@ -175,6 +176,21 @@ bool SignalRClient::Initialize(const std::string& hub_url, const std::string& to
                 ESP_LOGI(TAG, "Memory after connect: internal=%lu, min_free=%lu",
                          (unsigned long)heap_caps_get_free_size(MALLOC_CAP_INTERNAL),
                          (unsigned long)heap_caps_get_minimum_free_size(MALLOC_CAP_INTERNAL));
+                
+                // 🔄 Auto-register device info after connection confirmed
+                ESP_LOGI(TAG, "📤 Auto-registering device information...");
+                std::string mac_address = DeviceInfo::GetMacAddress();
+                std::string metadata = DeviceInfo::BuildMetadataJson();
+                
+                // Use a lambda to avoid blocking the notification handler
+                // Register device in background
+                RegisterDevice(mac_address, "", metadata, [](bool success, const std::string& result) {
+                    if (success) {
+                        ESP_LOGI(TAG, "✅ Device auto-registration successful: %s", result.c_str());
+                    } else {
+                        ESP_LOGW(TAG, "⚠️ Device auto-registration failed: %s", result.c_str());
+                    }
+                });
             }
         });
 
@@ -215,8 +231,37 @@ bool SignalRClient::Initialize(const std::string& hub_url, const std::string& to
             }
 
             try {
-                // Parse the first argument as JSON string or object
-                std::string json_str = args[0].as_string();
+                std::string json_str;
+                
+                // Handle both string and map/object types
+                if (args[0].is_string()) {
+                    json_str = args[0].as_string();
+                } else if (args[0].is_map()) {
+                    // Convert map to JSON string
+                    auto map = args[0].as_map();
+                    cJSON* root = cJSON_CreateObject();
+                    for (const auto& pair : map) {
+                        if (pair.second.is_string()) {
+                            cJSON_AddStringToObject(root, pair.first.c_str(), pair.second.as_string().c_str());
+                        } else if (pair.second.is_double()) {
+                            cJSON_AddNumberToObject(root, pair.first.c_str(), pair.second.as_double());
+                        } else if (pair.second.is_bool()) {
+                            cJSON_AddBoolToObject(root, pair.first.c_str(), pair.second.as_bool());
+                        } else if (pair.second.is_null()) {
+                            cJSON_AddNullToObject(root, pair.first.c_str());
+                        }
+                    }
+                    char* temp_str = cJSON_PrintUnformatted(root);
+                    if (temp_str) {
+                        json_str = temp_str;
+                        cJSON_free(temp_str);
+                    }
+                    cJSON_Delete(root);
+                } else {
+                    ESP_LOGW(TAG, "DeviceRegistered argument is neither string nor map, type: %d", (int)args[0].type());
+                    return;
+                }
+                
                 ESP_LOGI(TAG, "✅ Device registration confirmed: %s", json_str.c_str());
 
                 auto root = cJSON_Parse(json_str.c_str());
