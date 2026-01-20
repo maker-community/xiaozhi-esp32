@@ -200,6 +200,14 @@ void OledDisplay::SetupUI_128x64() {
     lv_label_set_text(mute_label_, "");
     lv_obj_set_style_text_font(mute_label_, icon_font, 0);
 
+#ifdef CONFIG_ENABLE_SIGNALR_CLIENT
+    // SignalR connection status indicator
+    signalr_label_ = lv_label_create(right_icons);
+    lv_label_set_text(signalr_label_, "");
+    lv_obj_set_style_text_font(signalr_label_, icon_font, 0);
+    ESP_LOGI("OledDisplay", "SignalR label created: %p", signalr_label_);
+#endif
+
     battery_label_ = lv_label_create(right_icons);
     lv_label_set_text(battery_label_, "");
     lv_obj_set_style_text_font(battery_label_, icon_font, 0);

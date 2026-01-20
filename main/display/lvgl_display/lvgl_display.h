@@ -36,6 +36,7 @@ protected:
     lv_obj_t *notification_label_ = nullptr;
     lv_obj_t *mute_label_ = nullptr;
     lv_obj_t *battery_label_ = nullptr;
+    lv_obj_t *signalr_label_ = nullptr;     // SignalR connection status indicator
     lv_obj_t* low_battery_popup_ = nullptr;
     lv_obj_t* low_battery_label_ = nullptr;
     lv_obj_t* qrcode_container_ = nullptr;  // QR code container
@@ -43,6 +44,7 @@ protected:
     
     const char* battery_icon_ = nullptr;
     const char* network_icon_ = nullptr;
+    const char* signalr_icon_ = nullptr;    // Cache last SignalR icon to avoid redundant updates
     bool muted_ = false;
 
     std::chrono::system_clock::time_point last_status_update_time_;

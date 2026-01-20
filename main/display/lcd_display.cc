@@ -416,6 +416,15 @@ void LcdDisplay::SetupUI() {
     lv_obj_set_style_text_font(mute_label_, icon_font, 0);
     lv_obj_set_style_text_color(mute_label_, lvgl_theme->text_color(), 0);
 
+#ifdef CONFIG_ENABLE_SIGNALR_CLIENT
+    // SignalR connection status indicator
+    signalr_label_ = lv_label_create(right_icons);
+    lv_label_set_text(signalr_label_, "");
+    lv_obj_set_style_text_font(signalr_label_, icon_font, 0);
+    lv_obj_set_style_text_color(signalr_label_, lvgl_theme->text_color(), 0);
+    lv_obj_set_style_margin_left(signalr_label_, lvgl_theme->spacing(2), 0);
+#endif
+
     battery_label_ = lv_label_create(right_icons);
     lv_label_set_text(battery_label_, "");
     lv_obj_set_style_text_font(battery_label_, icon_font, 0);
@@ -851,6 +860,15 @@ void LcdDisplay::SetupUI() {
     lv_label_set_text(mute_label_, "");
     lv_obj_set_style_text_font(mute_label_, icon_font, 0);
     lv_obj_set_style_text_color(mute_label_, lvgl_theme->text_color(), 0);
+
+#ifdef CONFIG_ENABLE_SIGNALR_CLIENT
+    // SignalR connection status indicator
+    signalr_label_ = lv_label_create(right_icons);
+    lv_label_set_text(signalr_label_, "");
+    lv_obj_set_style_text_font(signalr_label_, icon_font, 0);
+    lv_obj_set_style_text_color(signalr_label_, lvgl_theme->text_color(), 0);
+    lv_obj_set_style_margin_left(signalr_label_, lvgl_theme->spacing(2), 0);
+#endif
 
     battery_label_ = lv_label_create(right_icons);
     lv_label_set_text(battery_label_, "");

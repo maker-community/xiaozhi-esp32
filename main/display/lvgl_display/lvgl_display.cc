@@ -15,6 +15,10 @@
 #include "assets/lang_config.h"
 #include "jpg/image_to_jpeg.h"
 
+#ifdef CONFIG_ENABLE_SIGNALR_CLIENT
+#include "signalr_client.h"
+#endif
+
 #define TAG "Display"
 
 // QR code context structure for callback
@@ -211,6 +215,35 @@ void LvglDisplay::UpdateStatusBar(bool update_all) {
             }
         }
     }
+
+#ifdef CONFIG_ENABLE_SIGNALR_CLIENT
+    // Update SignalR connection status icon
+    if (signalr_label_ != nullptr) {
+        auto& signalr = SignalRClient::GetInstance();
+        const char* signalr_icon = nullptr;
+        lv_color_t icon_color = lv_color_hex(0xFFFFFF);  // Default white
+        
+        if (signalr.IsConnected()) {
+            signalr_icon = FONT_AWESOME_CIRCLE_CHECK;
+            icon_color = lv_color_hex(0x00FF00);  // Green
+        } else if (signalr.IsInitialized()) {
+            signalr_icon = FONT_AWESOME_CIRCLE_XMARK;
+            icon_color = lv_color_hex(0xFF0000);  // Red
+        } else {
+            signalr_icon = "";  // Not initialized - hide icon
+        }
+        
+        // Update icon if changed
+        if (signalr_icon_ != signalr_icon) {
+            DisplayLockGuard lock(this);
+            signalr_icon_ = signalr_icon;
+            lv_label_set_text(signalr_label_, signalr_icon_);
+            if (strlen(signalr_icon) > 0) {  // Only set color if icon is visible
+                lv_obj_set_style_text_color(signalr_label_, icon_color, 0);
+            }
+        }
+    }
+#endif
 
     esp_pm_lock_release(pm_lock_);
 }
