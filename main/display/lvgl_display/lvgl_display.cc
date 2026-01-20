@@ -227,12 +227,13 @@ void LvglDisplay::UpdateStatusBar(bool update_all) {
         bool is_initialized = signalr.IsInitialized();
         
         // Determine icon based on actual connection state
+        // Using bell and moon icons to represent messaging/notification service
         if (is_connected) {
-            signalr_icon = FONT_AWESOME_CIRCLE_CHECK;
-            icon_color = lv_color_hex(0x00FF00);  // Green
+            signalr_icon = FONT_AWESOME_BELL;  // Bell: notification service active
+            icon_color = lv_color_hex(0x00FF00);  // Green - receiving notifications
         } else if (is_initialized) {
-            signalr_icon = FONT_AWESOME_CIRCLE_XMARK;
-            icon_color = lv_color_hex(0xFF0000);  // Red
+            signalr_icon = FONT_AWESOME_MOON;  // Moon: notification service in standby/sleep mode
+            icon_color = lv_color_hex(0x808080);  // Gray - waiting to reconnect
         } else {
             signalr_icon = "";  // Not initialized - hide icon
         }
