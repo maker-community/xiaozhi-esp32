@@ -1,6 +1,7 @@
 #include "audio_service.h"
 #include <esp_log.h>
 #include <cstring>
+#include <esp_heap_caps.h>
 
 #define RATE_CVT_CFG(_src_rate, _dest_rate, _channel)        \
     (esp_ae_rate_cvt_cfg_t)                                  \
@@ -134,7 +135,7 @@ void AudioService::Start() {
         AudioService* audio_service = (AudioService*)arg;
         audio_service->AudioInputTask();
         vTaskDelete(NULL);
-    }, "audio_input", 2048 * 3, this, 8, &audio_input_task_handle_, 0);
+    }, "audio_input", 2048 * 3, this, 7, &audio_input_task_handle_, 0);
 
     /* Start the audio output task */
     xTaskCreate([](void* arg) {
@@ -148,7 +149,7 @@ void AudioService::Start() {
         AudioService* audio_service = (AudioService*)arg;
         audio_service->AudioInputTask();
         vTaskDelete(NULL);
-    }, "audio_input", 2048 * 2, this, 8, &audio_input_task_handle_);
+    }, "audio_input", 2048 * 2, this, 7, &audio_input_task_handle_);
 
     /* Start the audio output task */
     xTaskCreate([](void* arg) {
@@ -158,12 +159,28 @@ void AudioService::Start() {
     }, "audio_output", 2048, this, 4, &audio_output_task_handle_);
 #endif
 
-    /* Start the opus codec task */
-    xTaskCreate([](void* arg) {
-        AudioService* audio_service = (AudioService*)arg;
-        audio_service->OpusCodecTask();
-        vTaskDelete(NULL);
-    }, "opus_codec", 2048 * 12, this, 2, &opus_codec_task_handle_);
+    /* Start the opus codec task (stack allocated in PSRAM to save internal RAM) */
+    {
+        const size_t stack_size = 2048 * 12;
+        StackType_t* opus_stack = (StackType_t*)heap_caps_malloc(stack_size * sizeof(StackType_t), MALLOC_CAP_SPIRAM);
+        StaticTask_t* opus_tcb = (StaticTask_t*)heap_caps_malloc(sizeof(StaticTask_t), MALLOC_CAP_INTERNAL);
+        if (opus_stack != nullptr && opus_tcb != nullptr) {
+            opus_codec_task_handle_ = xTaskCreateStatic([](void* arg) {
+                AudioService* audio_service = (AudioService*)arg;
+                audio_service->OpusCodecTask();
+                vTaskDelete(NULL);
+            }, "opus_codec", stack_size, this, 2, opus_stack, opus_tcb);
+        } else {
+            // Fallback to dynamic creation if static allocation failed
+            if (opus_stack) heap_caps_free(opus_stack);
+            if (opus_tcb) heap_caps_free(opus_tcb);
+            xTaskCreate([](void* arg) {
+                AudioService* audio_service = (AudioService*)arg;
+                audio_service->OpusCodecTask();
+                vTaskDelete(NULL);
+            }, "opus_codec", 2048 * 12, this, 2, &opus_codec_task_handle_);
+        }
+    }
 }
 
 void AudioService::Stop() {
@@ -272,6 +289,7 @@ void AudioService::AudioInputTask() {
             if (samples > 0) {
                 if (ReadAudioData(data, 16000, samples)) {
                     wake_word_->Feed(data);
+                    vTaskDelay(pdMS_TO_TICKS(5));
                     continue;
                 }
             }
@@ -284,6 +302,7 @@ void AudioService::AudioInputTask() {
             if (samples > 0) {
                 if (ReadAudioData(data, 16000, samples)) {
                     audio_processor_->Feed(std::move(data));
+                    vTaskDelay(pdMS_TO_TICKS(5));
                     continue;
                 }
             }

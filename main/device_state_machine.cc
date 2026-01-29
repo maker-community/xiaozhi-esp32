@@ -2,6 +2,10 @@
 
 #include <algorithm>
 #include <esp_log.h>
+#include "freertos/FreeRTOS.h"
+#include <freertos/task.h>
+#include <esp_heap_caps.h>
+#include <stdlib.h>
 
 static const char* TAG = "StateMachine";
 
@@ -124,6 +128,47 @@ bool DeviceStateMachine::TransitionTo(DeviceState new_state) {
     current_state_.store(new_state);
     ESP_LOGI(TAG, "State: %s -> %s",
              GetStateName(old_state), GetStateName(new_state));
+
+    /* Diagnostic: when entering listening, print heap and task list for runtime investigation */
+    if (new_state == kDeviceStateListening) {
+        size_t free_heap = heap_caps_get_free_size(MALLOC_CAP_DEFAULT);
+        size_t min_free_heap = heap_caps_get_minimum_free_size(MALLOC_CAP_DEFAULT);
+        size_t free_internal = heap_caps_get_free_size(MALLOC_CAP_INTERNAL);
+        size_t min_internal = heap_caps_get_minimum_free_size(MALLOC_CAP_INTERNAL);
+        size_t free_spiram = 0;
+        size_t min_spiram = 0;
+    #if CONFIG_SPIRAM_SUPPORT
+        free_spiram = heap_caps_get_free_size(MALLOC_CAP_SPIRAM);
+        min_spiram = heap_caps_get_minimum_free_size(MALLOC_CAP_SPIRAM);
+    #endif
+
+        ESP_LOGI(TAG, "Heap total free: %u, min total free: %u", (unsigned int)free_heap, (unsigned int)min_free_heap);
+        ESP_LOGI(TAG, "Heap internal free: %u, min internal free: %u", (unsigned int)free_internal, (unsigned int)min_internal);
+    #if CONFIG_SPIRAM_SUPPORT
+        ESP_LOGI(TAG, "Heap PSRAM free: %u, min PSRAM free: %u", (unsigned int)free_spiram, (unsigned int)min_spiram);
+    #endif
+
+        UBaseType_t num_tasks = uxTaskGetNumberOfTasks();
+        ESP_LOGI(TAG, "Task count: %u", (unsigned int)num_tasks);
+
+    /* Detailed per-task stack high-water logging when trace facility is available */
+    #if defined(CONFIG_FREERTOS_USE_TRACE_FACILITY) && CONFIG_FREERTOS_USE_TRACE_FACILITY
+        TaskStatus_t* status_array = (TaskStatus_t*)heap_caps_malloc(num_tasks * sizeof(TaskStatus_t), MALLOC_CAP_SPIRAM);
+        if (status_array != nullptr) {
+            UBaseType_t returned = uxTaskGetSystemState(status_array, num_tasks, NULL);
+            for (UBaseType_t i = 0; i < returned; ++i) {
+                ESP_LOGI(TAG, "Task %s state=%u stackHighWater=%u", status_array[i].pcTaskName,
+                         (unsigned int)status_array[i].eCurrentState,
+                         (unsigned int)status_array[i].usStackHighWaterMark);
+            }
+            heap_caps_free(status_array);
+        } else {
+            ESP_LOGW(TAG, "Failed to allocate PSRAM TaskStatus_t array for diagnostics (PSRAM not available?)");
+        }
+    #else
+        ESP_LOGI(TAG, "Task stats not available; CONFIG_FREERTOS_USE_TRACE_FACILITY disabled");
+    #endif
+    }
 
     // Notify callback
     NotifyStateChange(old_state, new_state);

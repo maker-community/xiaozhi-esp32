@@ -67,11 +67,12 @@ void AfeAudioProcessor::Initialize(AudioCodec* codec, int frame_duration_ms, srm
     afe_iface_ = esp_afe_handle_from_config(afe_config);
     afe_data_ = afe_iface_->create_from_config(afe_config);
     
+    // Increase task priority
     xTaskCreate([](void* arg) {
         auto this_ = (AfeAudioProcessor*)arg;
         this_->AudioProcessorTask();
         vTaskDelete(NULL);
-    }, "audio_communication", 4096, this, 3, NULL);
+    }, "audio_communication", 4096, this, 7, NULL);
 }
 
 AfeAudioProcessor::~AfeAudioProcessor() {
@@ -136,6 +137,18 @@ void AfeAudioProcessor::AudioProcessorTask() {
                 ESP_LOGI(TAG, "Error code: %d", res->ret_value);
             }
             continue;
+        }
+
+        /* Lightweight heartbeat: count successful fetches and log periodically */
+        fetch_count_++;
+        if ((fetch_count_ % 100) == 0) {
+            ESP_LOGI(TAG, "AFE fetch heartbeat: %u", (unsigned int)fetch_count_);
+        }
+
+        /* Lightweight heartbeat: count successful fetches and log periodically */
+        fetch_count_++;
+        if ((fetch_count_ % 100) == 0) {
+            ESP_LOGI(TAG, "AFE fetch heartbeat: %u", (unsigned int)fetch_count_);
         }
 
         // VAD state change

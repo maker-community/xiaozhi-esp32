@@ -52,6 +52,7 @@ private:
     std::deque<std::vector<uint8_t>> wake_word_opus_;
     std::mutex wake_word_mutex_;
     std::condition_variable wake_word_cv_;
+    uint32_t fetch_count_ = 0;
 
     void StoreWakeWordData(const int16_t* data, size_t size);
     void AudioDetectionTask();

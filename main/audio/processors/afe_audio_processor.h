@@ -38,6 +38,7 @@ private:
     int frame_samples_ = 0;
     bool is_speaking_ = false;
     std::vector<int16_t> output_buffer_;
+    uint32_t fetch_count_ = 0;
 
     void AudioProcessorTask();
 };

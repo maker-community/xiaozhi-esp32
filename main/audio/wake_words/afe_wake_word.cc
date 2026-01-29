@@ -80,11 +80,12 @@ bool AfeWakeWord::Initialize(AudioCodec* codec, srmodel_list_t* models_list) {
     afe_iface_ = esp_afe_handle_from_config(afe_config);
     afe_data_ = afe_iface_->create_from_config(afe_config);
 
+    // Increase task priority
     xTaskCreate([](void* arg) {
         auto this_ = (AfeWakeWord*)arg;
         this_->AudioDetectionTask();
         vTaskDelete(NULL);
-    }, "audio_detection", 4096, this, 3, nullptr);
+    }, "audio_detection", 4096, this, 7, nullptr);
 
     return true;
 }
@@ -127,9 +128,16 @@ void AfeWakeWord::AudioDetectionTask() {
     while (true) {
         xEventGroupWaitBits(event_group_, DETECTION_RUNNING_EVENT, pdFALSE, pdTRUE, portMAX_DELAY);
 
+
         auto res = afe_iface_->fetch_with_delay(afe_data_, portMAX_DELAY);
         if (res == nullptr || res->ret_value == ESP_FAIL) {
             continue;;
+        }
+
+        /* Lightweight heartbeat for wake-word fetch task */
+        fetch_count_++;
+        if ((fetch_count_ % 100) == 0) {
+            ESP_LOGI(TAG, "AFE wake-word fetch heartbeat: %u", (unsigned int)fetch_count_);
         }
 
         // Store the wake word data for voice recognition, like who is speaking
