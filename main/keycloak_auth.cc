@@ -295,6 +295,10 @@ void KeycloakAuth::SaveTokens(const TokenResponse& token_response) {
     refresh_token_expires_at_ = now + token_response.refresh_expires_in;
     
     // 保存到NVS
+    settings_->EraseKey("access_token");
+    settings_->EraseKey("refresh_token");
+    settings_->EraseKey("access_expires");
+    settings_->EraseKey("refresh_expires");
     settings_->SetString("access_token", access_token_);
     settings_->SetString("refresh_token", refresh_token_);
     settings_->SetInt("access_expires", access_token_expires_at_);
