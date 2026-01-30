@@ -1,5 +1,6 @@
 #include "afe_audio_processor.h"
 #include <esp_log.h>
+#include <esp_heap_caps.h>
 
 #define PROCESSOR_RUNNING 0x01
 
@@ -67,12 +68,27 @@ void AfeAudioProcessor::Initialize(AudioCodec* codec, int frame_duration_ms, srm
     afe_iface_ = esp_afe_handle_from_config(afe_config);
     afe_data_ = afe_iface_->create_from_config(afe_config);
     
-    // Increase task priority
-    xTaskCreate([](void* arg) {
-        auto this_ = (AfeAudioProcessor*)arg;
-        this_->AudioProcessorTask();
-        vTaskDelete(NULL);
-    }, "audio_communication", 4096, this, 7, NULL);
+    // Increase task priority, allocate stack in PSRAM and TCB in internal RAM, fallback to dynamic on failure
+    {
+        const size_t stack_size = 4096;
+        StackType_t* processor_stack = (StackType_t*)heap_caps_malloc(stack_size * sizeof(StackType_t), MALLOC_CAP_SPIRAM);
+        StaticTask_t* processor_tcb = (StaticTask_t*)heap_caps_malloc(sizeof(StaticTask_t), MALLOC_CAP_INTERNAL);
+        if (processor_stack != nullptr && processor_tcb != nullptr) {
+            xTaskCreateStatic([](void* arg) {
+                auto this_ = (AfeAudioProcessor*)arg;
+                this_->AudioProcessorTask();
+                vTaskDelete(NULL);
+            }, "audio_communication", stack_size, this, 7, processor_stack, processor_tcb);
+        } else {
+            if (processor_stack) heap_caps_free(processor_stack);
+            if (processor_tcb) heap_caps_free(processor_tcb);
+            xTaskCreate([](void* arg) {
+                auto this_ = (AfeAudioProcessor*)arg;
+                this_->AudioProcessorTask();
+                vTaskDelete(NULL);
+            }, "audio_communication", 4096, this, 7, NULL);
+        }
+    }
 }
 
 AfeAudioProcessor::~AfeAudioProcessor() {

@@ -1,5 +1,6 @@
 #include "afe_wake_word.h"
 #include "audio_service.h"
+#include <esp_heap_caps.h>
 #include <esp_log.h>
 #include <sstream>
 
@@ -80,12 +81,27 @@ bool AfeWakeWord::Initialize(AudioCodec* codec, srmodel_list_t* models_list) {
     afe_iface_ = esp_afe_handle_from_config(afe_config);
     afe_data_ = afe_iface_->create_from_config(afe_config);
 
-    // Increase task priority
-    xTaskCreate([](void* arg) {
-        auto this_ = (AfeWakeWord*)arg;
-        this_->AudioDetectionTask();
-        vTaskDelete(NULL);
-    }, "audio_detection", 4096, this, 7, nullptr);
+    // Increase task priority, use PSRAM stack + internal TCB with dynamic fallback
+    {
+        const size_t stack_size = 4096;
+        StackType_t* detect_stack = (StackType_t*)heap_caps_malloc(stack_size * sizeof(StackType_t), MALLOC_CAP_SPIRAM);
+        StaticTask_t* detect_tcb = (StaticTask_t*)heap_caps_malloc(sizeof(StaticTask_t), MALLOC_CAP_INTERNAL);
+        if (detect_stack != nullptr && detect_tcb != nullptr) {
+            xTaskCreateStatic([](void* arg) {
+                auto this_ = (AfeWakeWord*)arg;
+                this_->AudioDetectionTask();
+                vTaskDelete(NULL);
+            }, "audio_detection", stack_size, this, 7, detect_stack, detect_tcb);
+        } else {
+            if (detect_stack) heap_caps_free(detect_stack);
+            if (detect_tcb) heap_caps_free(detect_tcb);
+            xTaskCreate([](void* arg) {
+                auto this_ = (AfeWakeWord*)arg;
+                this_->AudioDetectionTask();
+                vTaskDelete(NULL);
+            }, "audio_detection", 4096, this, 7, nullptr);
+        }
+    }
 
     return true;
 }
