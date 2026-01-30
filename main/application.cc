@@ -1150,7 +1150,7 @@ void Application::HandleSignalRAudioMessage(const char* url) {
         }
         
         size_t content_length = http->GetBodyLength();
-        if (content_length == 0 || content_length > 512 * 1024) { // Max 512KB for audio
+        if (content_length == 0 || content_length > 1024 * 1024) { // Max 1MB for audio
             ESP_LOGE(TAG, "Invalid audio content length: %d", content_length);
             http->Close();
             return;
