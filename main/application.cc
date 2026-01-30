@@ -911,6 +911,19 @@ void Application::HandleSignalRMessage(const std::string& message) {
 void Application::HandleSignalRImageMessage(const char* url) {
 #ifdef HAVE_LVGL
     ESP_LOGI(TAG, "Downloading image from: %s", url);
+    // Pause audio processing and wake-word detection to avoid AFE ringbuffer overflow
+    bool was_processor_running = audio_service_.IsAudioProcessorRunning();
+    bool was_wake_running = audio_service_.IsWakeWordRunning();
+    audio_service_.EnableVoiceProcessing(false);
+    audio_service_.EnableWakeWordDetection(false);
+    // Wait for playback queue to drain before heavy work (decoding/download)
+    audio_service_.WaitForPlaybackQueueEmpty();
+    // Scope guard: restore previous audio state on any exit path
+    struct ScopeGuard { std::function<void()> f; ScopeGuard(std::function<void()> fn): f(fn) {} ~ScopeGuard(){ if (f) f(); } };
+    ScopeGuard __restore_audio([&](){
+        if (was_processor_running) audio_service_.EnableVoiceProcessing(true);
+        if (was_wake_running) audio_service_.EnableWakeWordDetection(true);
+    });
     
     std::string current_url = url;
     int max_redirects = 5;

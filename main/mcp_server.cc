@@ -260,6 +260,20 @@ void McpServer::AddUserOnlyTools() {
             }),
             [display](const PropertyList& properties) -> ReturnValue {
                 auto url = properties["url"].value<std::string>();
+                // Pause audio processing while downloading/previewing image to avoid AFE overflow
+                auto& app = Application::GetInstance();
+                auto& audio = app.GetAudioService();
+                bool was_processor_running = audio.IsAudioProcessorRunning();
+                bool was_wake_running = audio.IsWakeWordRunning();
+                audio.EnableVoiceProcessing(false);
+                audio.EnableWakeWordDetection(false);
+                audio.WaitForPlaybackQueueEmpty();
+                struct ScopeGuard { std::function<void()> f; ScopeGuard(std::function<void()> fn): f(fn) {} ~ScopeGuard(){ if (f) f(); } };
+                ScopeGuard __restore_audio([&](){
+                    if (was_processor_running) audio.EnableVoiceProcessing(true);
+                    if (was_wake_running) audio.EnableWakeWordDetection(true);
+                });
+
                 auto http = Board::GetInstance().GetNetwork()->CreateHttp(3);
 
                 if (!http->Open("GET", url)) {
