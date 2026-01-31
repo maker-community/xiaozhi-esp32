@@ -587,7 +587,9 @@ void Application::InitializeProtocol() {
         Schedule([this]() {
             auto display = Board::GetInstance().GetDisplay();
             display->SetChatMessage("system", "");
-            SetDeviceState(kDeviceStateIdle);
+            if (!signalr_audio_playing_) {
+                SetDeviceState(kDeviceStateIdle);
+            }
         });
     });
     
@@ -603,7 +605,7 @@ void Application::InitializeProtocol() {
                 });
             } else if (strcmp(state->valuestring, "stop") == 0) {
                 Schedule([this]() {
-                    if (GetDeviceState() == kDeviceStateSpeaking) {
+                    if (!signalr_audio_playing_ && GetDeviceState() == kDeviceStateSpeaking) {
                         if (listening_mode_ == kListeningModeManualStop) {
                             SetDeviceState(kDeviceStateIdle);
                         } else {
@@ -1182,6 +1184,7 @@ void Application::HandleSignalRAudioMessage(const char* url) {
         // Enter speaking state on main task, then parse & push OGG->Opus packets in background
         Schedule([this]() {
             aborted_ = false;
+            signalr_audio_playing_ = true;
             SetDeviceState(kDeviceStateSpeaking);
         });
 
@@ -1287,6 +1290,7 @@ void Application::HandleSignalRAudioMessage(const char* url) {
 
             // Restore state on main task
             Schedule([this]() {
+                signalr_audio_playing_ = false;
                 if (GetDeviceState() == kDeviceStateSpeaking) {
                     SetDeviceState(kDeviceStateIdle);
                 }
@@ -1563,6 +1567,7 @@ void Application::Schedule(std::function<void()>&& callback) {
 void Application::AbortSpeaking(AbortReason reason) {
     ESP_LOGI(TAG, "Abort speaking");
     aborted_ = true;
+    signalr_audio_playing_ = false;  // Clear SignalR audio playing flag
     if (protocol_) {
         protocol_->SendAbortSpeaking(reason);
     }
