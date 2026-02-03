@@ -587,7 +587,9 @@ void Application::InitializeProtocol() {
         Schedule([this]() {
             auto display = Board::GetInstance().GetDisplay();
             display->SetChatMessage("system", "");
-            SetDeviceState(kDeviceStateIdle);
+            if (!signalr_audio_playing_) {
+                SetDeviceState(kDeviceStateIdle);
+            }
         });
     });
     
@@ -603,7 +605,7 @@ void Application::InitializeProtocol() {
                 });
             } else if (strcmp(state->valuestring, "stop") == 0) {
                 Schedule([this]() {
-                    if (GetDeviceState() == kDeviceStateSpeaking) {
+                    if (!signalr_audio_playing_ && GetDeviceState() == kDeviceStateSpeaking) {
                         if (listening_mode_ == kListeningModeManualStop) {
                             SetDeviceState(kDeviceStateIdle);
                         } else {
@@ -1178,9 +1180,122 @@ void Application::HandleSignalRAudioMessage(const char* url) {
         http->Close();
         
         ESP_LOGI(TAG, "Audio downloaded: %d bytes", total_read);
-        
-        // Play the audio (OGG format)
-        audio_service_.PlaySound(std::string_view(audio_data.data(), audio_data.size()));
+
+        // Enter speaking state on main task, then parse & push OGG->Opus packets in background
+        Schedule([this]() {
+            aborted_ = false;
+            signalr_audio_playing_ = true;
+            SetDeviceState(kDeviceStateSpeaking);
+        });
+
+        // Spawn a background thread to parse OGG and push packets to decode queue (non-blocking)
+        std::thread([this, audio = std::move(audio_data)]() mutable {
+            const uint8_t* buf = reinterpret_cast<const uint8_t*>(audio.data());
+            size_t size = audio.size();
+            size_t offset = 0;
+
+            auto find_page = [&](size_t start)->size_t {
+                for (size_t i = start; i + 4 <= size; ++i) {
+                    if (buf[i] == 'O' && buf[i+1] == 'g' && buf[i+2] == 'g' && buf[i+3] == 'S') return i;
+                }
+                return static_cast<size_t>(-1);
+            };
+
+            bool seen_head = false;
+            bool seen_tags = false;
+            int sample_rate = 16000;
+
+            while (true) {
+                if (aborted_) break;
+                size_t pos = find_page(offset);
+                if (pos == static_cast<size_t>(-1)) break;
+                offset = pos;
+                if (offset + 27 > size) break;
+
+                const uint8_t* page = buf + offset;
+                uint8_t page_segments = page[26];
+                size_t seg_table_off = offset + 27;
+                if (seg_table_off + page_segments > size) break;
+
+                size_t body_size = 0;
+                for (size_t i = 0; i < page_segments; ++i) body_size += page[27 + i];
+
+                size_t body_off = seg_table_off + page_segments;
+                if (body_off + body_size > size) break;
+
+                // Parse packets using lacing
+                size_t cur = body_off;
+                size_t seg_idx = 0;
+                while (seg_idx < page_segments) {
+                    if (aborted_) break;
+                    size_t pkt_len = 0;
+                    size_t pkt_start = cur;
+                    bool continued = false;
+                    do {
+                        uint8_t l = page[27 + seg_idx++];
+                        pkt_len += l;
+                        cur += l;
+                        continued = (l == 255);
+                    } while (continued && seg_idx < page_segments);
+
+                    if (pkt_len == 0) continue;
+                    const uint8_t* pkt_ptr = buf + pkt_start;
+
+                    if (!seen_head) {
+                        if (pkt_len >= 19 && std::memcmp(pkt_ptr, "OpusHead", 8) == 0) {
+                            seen_head = true;
+                            if (pkt_len >= 16) {
+                                sample_rate = pkt_ptr[12] | (pkt_ptr[13] << 8) |
+                                              (pkt_ptr[14] << 16) | (pkt_ptr[15] << 24);
+                            }
+                        }
+                        continue;
+                    }
+                    if (!seen_tags) {
+                        if (pkt_len >= 8 && std::memcmp(pkt_ptr, "OpusTags", 8) == 0) {
+                            seen_tags = true;
+                        }
+                        continue;
+                    }
+
+                    // Audio packet -> push to decode queue (non-blocking)
+                    auto packet = std::make_unique<AudioStreamPacket>();
+                    packet->sample_rate = sample_rate;
+                    packet->frame_duration = 60;
+                    packet->payload.resize(pkt_len);
+                    std::memcpy(packet->payload.data(), pkt_ptr, pkt_len);
+
+                    // Try pushing without blocking; if queue full wait a bit and retry, but respect abort
+                    while (!audio_service_.PushPacketToDecodeQueue(std::move(packet), false)) {
+                        if (aborted_) break;
+                        vTaskDelay(pdMS_TO_TICKS(20));
+                        // recreate packet from original ptr since ownership moved only on success
+                        packet = std::make_unique<AudioStreamPacket>();
+                        packet->sample_rate = sample_rate;
+                        packet->frame_duration = 60;
+                        packet->payload.resize(pkt_len);
+                        std::memcpy(packet->payload.data(), pkt_ptr, pkt_len);
+                    }
+                }
+
+                offset = body_off + body_size;
+            }
+
+            // Wait until playback queue empties or aborted
+            while (!aborted_) {
+                // If playback finished, break
+                if (audio_service_.IsIdle()) break;
+                vTaskDelay(pdMS_TO_TICKS(50));
+            }
+
+            // Restore state on main task
+            Schedule([this]() {
+                signalr_audio_playing_ = false;
+                if (GetDeviceState() == kDeviceStateSpeaking) {
+                    SetDeviceState(kDeviceStateIdle);
+                }
+            });
+        }).detach();
         return;
     }
     
@@ -1489,9 +1604,12 @@ void Application::Schedule(std::function<void()>&& callback) {
 void Application::AbortSpeaking(AbortReason reason) {
     ESP_LOGI(TAG, "Abort speaking");
     aborted_ = true;
+    signalr_audio_playing_ = false;  // Clear SignalR audio playing flag
     if (protocol_) {
         protocol_->SendAbortSpeaking(reason);
     }
+    // Ensure any queued playback (including SignalR full-ogg playback) is stopped
+    audio_service_.ResetDecoder();
 }
 
 void Application::SetListeningMode(ListeningMode mode) {
