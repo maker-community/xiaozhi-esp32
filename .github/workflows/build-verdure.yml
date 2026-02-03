@@ -29,9 +29,7 @@ jobs:
       - id: list
         name: Get all variant list
         run: |
-          echo "all_variants<<EOF" >> $GITHUB_OUTPUT
-          python scripts/release-verdure.py --list-boards --json >> $GITHUB_OUTPUT
-          echo "EOF" >> $GITHUB_OUTPUT
+          echo "all_variants=$(python scripts/release-verdure.py --list-boards --json | jq -c)" >> $GITHUB_OUTPUT
 
       - id: select
         name: Select variants based on changes

@@ -156,6 +156,7 @@ def _collect_variants(config_filename: str = "config.json") -> list[dict[str, st
             continue
         cfg_path = board_path / config_filename
         if not cfg_path.exists():
+            # 输出到 stderr，不影响 JSON 输出
             print(f"[WARN] {cfg_path} does not exist, skip", file=sys.stderr)
             continue
         try:
@@ -352,10 +353,11 @@ if __name__ == "__main__":
 
     args = parser.parse_args()
 
-    print(f"[Verdure] 使用 Verdure 定制构建脚本，版本后缀: {VERDURE_SUFFIX}")
-
-    # List mode
+    # List mode - 在 JSON 模式下不输出额外信息
     if args.list_boards:
+        if not args.json:
+            print(f"[Verdure] 使用 Verdure 定制构建脚本，版本后缀: {VERDURE_SUFFIX}")
+        
         variants = _collect_variants(config_filename=args.config)
         if args.json:
             print(json.dumps(variants))
