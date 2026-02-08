@@ -1345,10 +1345,18 @@ void Application::HandleSignalRAudioMessage(const char* url) {
             }
 
             // Restore state on main task
+            // Follow the same logic as normal TTS stop: if audio channel is open
+            // and listening mode is not manual-stop, transition to Listening so
+            // the user can continue the conversation without a wake word.
             Schedule([this]() {
                 signalr_audio_playing_ = false;
                 if (GetDeviceState() == kDeviceStateSpeaking) {
-                    SetDeviceState(kDeviceStateIdle);
+                    if (protocol_ && protocol_->IsAudioChannelOpened() &&
+                        listening_mode_ != kListeningModeManualStop) {
+                        SetDeviceState(kDeviceStateListening);
+                    } else {
+                        SetDeviceState(kDeviceStateIdle);
+                    }
                 }
             });
         }).detach();
