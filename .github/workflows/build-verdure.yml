@@ -11,6 +11,9 @@ on:
 permissions:
   contents: read
 
+env:
+  VERDURE_SUBVER: ""
+
 jobs:
   prepare:
     name: Determine variants to build
@@ -105,6 +108,6 @@ jobs:
       - name: Upload artifacts
         uses: actions/upload-artifact@v4
         with:
-          name: xiaozhi_${{ matrix.name }}-verdure_${{ github.sha }}.bin
+          name: xiaozhi_${{ matrix.name }}-verdure${{ env.VERDURE_SUBVER != '' && format('.{0}', env.VERDURE_SUBVER) || '' }}_${{ github.sha }}.bin
           path: build/merged-binary.bin
           if-no-files-found: error
