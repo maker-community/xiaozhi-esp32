@@ -25,6 +25,7 @@
 #include <driver/gpio.h>
 #include <arpa/inet.h>
 #include <font_awesome.h>
+#include <freertos/semphr.h>
 
 #define TAG "Application"
 
@@ -1125,6 +1126,29 @@ void Application::HandleSignalRImageMessage(const char* url) {
 void Application::HandleSignalRAudioMessage(const char* url) {
     ESP_LOGI(TAG, "Downloading audio from: %s", url);
     
+    // Pause audio processing and wake-word detection to avoid AFE ringbuffer overflow during download
+    bool was_processor_running = audio_service_.IsAudioProcessorRunning();
+    bool was_wake_running = audio_service_.IsWakeWordRunning();
+    audio_service_.EnableVoiceProcessing(false);
+    audio_service_.EnableWakeWordDetection(false);
+    
+    // If currently listening, stop listening on protocol directly (we're already on main task)
+    if (GetDeviceState() == kDeviceStateListening && protocol_) {
+        protocol_->SendStopListening();
+    }
+    
+    // Scope guard: restore audio state on error/early-return paths
+    struct AudioScopeGuard {
+        AudioService& svc; bool proc, wake, active;
+        AudioScopeGuard(AudioService& s, bool p, bool w) : svc(s), proc(p), wake(w), active(true) {}
+        void dismiss() { active = false; }
+        ~AudioScopeGuard() {
+            if (!active) return;
+            if (proc) svc.EnableVoiceProcessing(true);
+            if (wake) svc.EnableWakeWordDetection(true);
+        }
+    } audio_guard(audio_service_, was_processor_running, was_wake_running);
+    
     std::string current_url = url;
     int max_redirects = 5;
     int redirect_count = 0;
@@ -1208,14 +1232,20 @@ void Application::HandleSignalRAudioMessage(const char* url) {
         ESP_LOGI(TAG, "Audio downloaded: %d bytes", total_read);
 
         // Enter speaking state on main task, then parse & push OGG->Opus packets in background
-        Schedule([this]() {
+        // Use a semaphore to ensure ResetDecoder completes before pushing audio packets
+        auto state_ready = std::make_shared<SemaphoreHandle_t>(xSemaphoreCreateBinary());
+        Schedule([this, state_ready]() {
             aborted_ = false;
             signalr_audio_playing_ = true;
             SetDeviceState(kDeviceStateSpeaking);
+            xSemaphoreGive(*state_ready);
         });
 
         // Spawn a background thread to parse OGG and push packets to decode queue (non-blocking)
-        std::thread([this, audio = std::move(audio_data)]() mutable {
+        std::thread([this, audio = std::move(audio_data), state_ready]() mutable {
+            // Wait for state transition (and ResetDecoder) to complete before pushing packets
+            xSemaphoreTake(*state_ready, pdMS_TO_TICKS(2000));
+            vSemaphoreDelete(*state_ready);
             const uint8_t* buf = reinterpret_cast<const uint8_t*>(audio.data());
             size_t size = audio.size();
             size_t offset = 0;
@@ -1322,6 +1352,7 @@ void Application::HandleSignalRAudioMessage(const char* url) {
                 }
             });
         }).detach();
+        audio_guard.dismiss();  // Speaking state manages audio, don't restore
         return;
     }
     
@@ -1503,8 +1534,8 @@ void Application::HandleWakeWordDetectedEvent() {
         audio_service_.EncodeWakeWord();
         auto wake_word = audio_service_.GetLastWakeWord();
 
+        SetDeviceState(kDeviceStateConnecting);
         if (!protocol_->IsAudioChannelOpened()) {
-            SetDeviceState(kDeviceStateConnecting);
             // Schedule to let the state change be processed first (UI update),
             // then continue with OpenAudioChannel which may block for ~1 second
             Schedule([this, wake_word]() {
