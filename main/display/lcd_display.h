@@ -11,7 +11,7 @@
 #include <atomic>
 #include <memory>
 
-#define PREVIEW_IMAGE_DURATION_MS 5000
+#define PREVIEW_IMAGE_DURATION_MS 10000
 
 
 class LcdDisplay : public LvglDisplay {
@@ -34,6 +34,7 @@ protected:
     lv_obj_t* chat_message_label_ = nullptr;
     esp_timer_handle_t preview_timer_ = nullptr;
     std::unique_ptr<LvglImage> preview_image_cached_ = nullptr;
+    int preview_duration_ms_ = PREVIEW_IMAGE_DURATION_MS;
     bool hide_subtitle_ = false;  // Control whether to hide chat messages/subtitles
 
     void InitializeLcdThemes();
