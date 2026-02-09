@@ -315,16 +315,30 @@ std::string KeycloakAuth::GetRefreshToken() {
 }
 
 void KeycloakAuth::SaveTokens(const TokenResponse& token_response) {
-    access_token_ = token_response.access_token;
-    refresh_token_ = token_response.refresh_token;
+    if (!token_response.access_token.empty()) {
+        access_token_ = token_response.access_token;
+    }
+    if (!token_response.refresh_token.empty()) {
+        refresh_token_ = token_response.refresh_token;
+    }
     
     // 计算过期时间戳
     struct timeval tv;
     gettimeofday(&tv, NULL);
     int64_t now = tv.tv_sec;
     
-    access_token_expires_at_ = now + token_response.expires_in;
-    refresh_token_expires_at_ = now + token_response.refresh_expires_in;
+    if (token_response.expires_in > 0) {
+        access_token_expires_at_ = now + token_response.expires_in;
+    } else {
+        access_token_expires_at_ = 0;
+    }
+
+    // refresh_expires_in == 0 from Keycloak means offline/unknown expiry.
+    if (token_response.refresh_expires_in > 0) {
+        refresh_token_expires_at_ = now + token_response.refresh_expires_in;
+    } else {
+        refresh_token_expires_at_ = 0;
+    }
     
     // 保存到NVS
     settings_->EraseKey("access_token");
