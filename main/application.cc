@@ -25,6 +25,7 @@
 #include <driver/gpio.h>
 #include <arpa/inet.h>
 #include <font_awesome.h>
+#include <freertos/semphr.h>
 
 #define TAG "Application"
 
@@ -271,7 +272,7 @@ void Application::Run() {
                 static int signalr_disconnect_detect_count = 0;
                 auto& signalr = SignalRClient::GetInstance();
                 if (signalr.IsInitialized()) {
-                    // First, check if token is still valid before attempting reconnect
+                    // Quick check: read token expiry from NVS
                     Settings token_storage("keycloak", false);
                     std::string token = token_storage.GetString("access_token", "");
                     int64_t expires_at = token_storage.GetInt("access_expires", 0);
@@ -283,10 +284,42 @@ void Application::Run() {
                     bool token_valid = !token.empty() && expires_at > now;
                     
                     if (!token_valid) {
-                        // Token expired or missing - destroy SignalR to save resources
-                        ESP_LOGW(TAG, "Token expired or missing - destroying SignalR to save resources");
-                        signalr.Reset();
-                        signalr_disconnect_detect_count = 0;
+                        // Access token expired or missing
+                        // Try to refresh using refresh_token before destroying SignalR
+                        static int64_t last_token_refresh_attempt = 0;
+                        std::string refresh_token = token_storage.GetString("refresh_token", "");
+                        int64_t refresh_expires = token_storage.GetInt("refresh_expires", 0);
+                        bool has_valid_refresh = !refresh_token.empty() && 
+                                                 (refresh_expires == 0 || refresh_expires > now);
+                        
+                        if (has_valid_refresh && (now - last_token_refresh_attempt >= 30)) {
+                            // Attempt refresh (at most once per 30 seconds to avoid hammering server)
+                            last_token_refresh_attempt = now;
+                            ESP_LOGI(TAG, "Access token expired, attempting refresh via refresh_token...");
+                            
+                            std::string server_url = token_storage.GetString("server_url", "https://auth.verdure-hiro.cn/");
+                            std::string realm = token_storage.GetString("realm", "maker-community");
+                            std::string client_id = token_storage.GetString("client_id", "verdure-assistant");
+                            
+                            KeycloakAuth auth(server_url, realm, client_id);
+                            if (auth.RefreshToken() == ESP_OK) {
+                                // Token refreshed! Reinitialize SignalR with the new token
+                                ESP_LOGI(TAG, "✅ Token refreshed successfully, reinitializing SignalR...");
+                                signalr.Reset();
+                                signalr_disconnect_detect_count = 0;
+                                InitializeSignalR();
+                            } else {
+                                // Refresh failed - will retry after cooldown
+                                // Don't destroy SignalR yet, wait for next retry or until refresh_token expires
+                                ESP_LOGW(TAG, "Token refresh failed, will retry in 30s");
+                            }
+                        } else if (!has_valid_refresh) {
+                            // No valid refresh token - user needs to re-login
+                            ESP_LOGW(TAG, "Token expired and no valid refresh_token - destroying SignalR (re-login required)");
+                            signalr.Reset();
+                            signalr_disconnect_detect_count = 0;
+                        }
+                        // If within cooldown period, do nothing (wait for next attempt)
                     } else {
                         // Token valid - proceed with reconnection check
                         // Pure polling: check if disconnected and not currently connecting
@@ -704,30 +737,24 @@ void Application::InitializeSignalR() {
     
     ESP_LOGI(TAG, "SignalR Hub URL: %s", hub_url.c_str());
     
-    // 直接从 NVS 读取已保存的 access token（不依赖 Keycloak 配置）
-    ESP_LOGI(TAG, "========== Loading Saved Token ==========");
-    Settings token_storage("keycloak", false);
-    std::string token = token_storage.GetString("access_token", "");
-    int64_t expires_at = token_storage.GetInt("access_expires", 0);
+    // 使用 KeycloakAuth 验证token（如果access_token过期，自动尝试refresh_token刷新）
+    ESP_LOGI(TAG, "========== Loading/Refreshing Token ==========");
+    Settings kc_settings("keycloak", false);
+    std::string server_url = kc_settings.GetString("server_url", "https://auth.verdure-hiro.cn/");
+    std::string realm = kc_settings.GetString("realm", "maker-community");
+    std::string client_id = kc_settings.GetString("client_id", "verdure-assistant");
     
-    if (!token.empty()) {
-        // 检查token是否过期
-        struct timeval tv;
-        gettimeofday(&tv, NULL);
-        int64_t now = tv.tv_sec;
-        
-        if (expires_at > now) {
-            ESP_LOGI(TAG, "✅ Found valid saved token");
-            ESP_LOGI(TAG, "Token length: %d characters", token.length());
-            ESP_LOGI(TAG, "Token expires in: %lld seconds", (long long)(expires_at - now));
-        } else {
-            ESP_LOGW(TAG, "⚠️ Saved token has expired, clearing...");
-            token.clear();
-        }
+    KeycloakAuth auth(server_url, realm, client_id);
+    std::string token;
+    
+    if (auth.IsAuthenticated()) {
+        token = auth.GetAccessToken();
+        ESP_LOGI(TAG, "✅ Valid token available (possibly auto-refreshed via refresh_token)");
+        ESP_LOGI(TAG, "Token length: %d characters", token.length());
     } else {
-        ESP_LOGW(TAG, "No saved token found");
+        ESP_LOGW(TAG, "⚠️ No valid token available (login required)");
     }
-    ESP_LOGI(TAG, "==========================================");
+    ESP_LOGI(TAG, "==============================================");
     
     // 🔒 Only initialize SignalR if we have a valid token
     // Without token, SignalR functionality is limited/useless, so skip to save resources
@@ -1099,6 +1126,29 @@ void Application::HandleSignalRImageMessage(const char* url) {
 void Application::HandleSignalRAudioMessage(const char* url) {
     ESP_LOGI(TAG, "Downloading audio from: %s", url);
     
+    // Pause audio processing and wake-word detection to avoid AFE ringbuffer overflow during download
+    bool was_processor_running = audio_service_.IsAudioProcessorRunning();
+    bool was_wake_running = audio_service_.IsWakeWordRunning();
+    audio_service_.EnableVoiceProcessing(false);
+    audio_service_.EnableWakeWordDetection(false);
+    
+    // If currently listening, stop listening on protocol directly (we're already on main task)
+    if (GetDeviceState() == kDeviceStateListening && protocol_) {
+        protocol_->SendStopListening();
+    }
+    
+    // Scope guard: restore audio state on error/early-return paths
+    struct AudioScopeGuard {
+        AudioService& svc; bool proc, wake, active;
+        AudioScopeGuard(AudioService& s, bool p, bool w) : svc(s), proc(p), wake(w), active(true) {}
+        void dismiss() { active = false; }
+        ~AudioScopeGuard() {
+            if (!active) return;
+            if (proc) svc.EnableVoiceProcessing(true);
+            if (wake) svc.EnableWakeWordDetection(true);
+        }
+    } audio_guard(audio_service_, was_processor_running, was_wake_running);
+    
     std::string current_url = url;
     int max_redirects = 5;
     int redirect_count = 0;
@@ -1182,14 +1232,20 @@ void Application::HandleSignalRAudioMessage(const char* url) {
         ESP_LOGI(TAG, "Audio downloaded: %d bytes", total_read);
 
         // Enter speaking state on main task, then parse & push OGG->Opus packets in background
-        Schedule([this]() {
+        // Use a semaphore to ensure ResetDecoder completes before pushing audio packets
+        auto state_ready = std::make_shared<SemaphoreHandle_t>(xSemaphoreCreateBinary());
+        Schedule([this, state_ready]() {
             aborted_ = false;
             signalr_audio_playing_ = true;
             SetDeviceState(kDeviceStateSpeaking);
+            xSemaphoreGive(*state_ready);
         });
 
         // Spawn a background thread to parse OGG and push packets to decode queue (non-blocking)
-        std::thread([this, audio = std::move(audio_data)]() mutable {
+        std::thread([this, audio = std::move(audio_data), state_ready]() mutable {
+            // Wait for state transition (and ResetDecoder) to complete before pushing packets
+            xSemaphoreTake(*state_ready, pdMS_TO_TICKS(2000));
+            vSemaphoreDelete(*state_ready);
             const uint8_t* buf = reinterpret_cast<const uint8_t*>(audio.data());
             size_t size = audio.size();
             size_t offset = 0;
@@ -1289,13 +1345,22 @@ void Application::HandleSignalRAudioMessage(const char* url) {
             }
 
             // Restore state on main task
+            // Follow the same logic as normal TTS stop: if audio channel is open
+            // and listening mode is not manual-stop, transition to Listening so
+            // the user can continue the conversation without a wake word.
             Schedule([this]() {
                 signalr_audio_playing_ = false;
                 if (GetDeviceState() == kDeviceStateSpeaking) {
-                    SetDeviceState(kDeviceStateIdle);
+                    if (protocol_ && protocol_->IsAudioChannelOpened() &&
+                        listening_mode_ != kListeningModeManualStop) {
+                        SetDeviceState(kDeviceStateListening);
+                    } else {
+                        SetDeviceState(kDeviceStateIdle);
+                    }
                 }
             });
         }).detach();
+        audio_guard.dismiss();  // Speaking state manages audio, don't restore
         return;
     }
     
@@ -1477,8 +1542,8 @@ void Application::HandleWakeWordDetectedEvent() {
         audio_service_.EncodeWakeWord();
         auto wake_word = audio_service_.GetLastWakeWord();
 
+        SetDeviceState(kDeviceStateConnecting);
         if (!protocol_->IsAudioChannelOpened()) {
-            SetDeviceState(kDeviceStateConnecting);
             // Schedule to let the state change be processed first (UI update),
             // then continue with OpenAudioChannel which may block for ~1 second
             Schedule([this, wake_word]() {

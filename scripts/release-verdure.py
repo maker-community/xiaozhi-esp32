@@ -23,7 +23,15 @@ from typing import Optional
 os.chdir(Path(__file__).resolve().parent.parent)
 
 # Verdure 版本标识
-VERDURE_SUFFIX = "-verdure"
+VERDURE_BASE_SUFFIX = "-verdure"
+
+
+def get_verdure_suffix() -> str:
+    """Build verdure suffix with optional sub-version from env VERDURE_SUBVER."""
+    subver = os.getenv("VERDURE_SUBVER", "").strip()
+    if subver:
+        return f"{VERDURE_BASE_SUFFIX}.{subver}"
+    return VERDURE_BASE_SUFFIX
 
 ################################################################################
 # Common utility functions
@@ -54,10 +62,11 @@ def get_project_version() -> Optional[str]:
     return None
 
 
-def patch_cmake_version(version_suffix: str = VERDURE_SUFFIX) -> None:
+def patch_cmake_version(version_suffix: Optional[str] = None) -> None:
     """临时修改 CMakeLists.txt 的 PROJECT_VER，添加版本后缀"""
     cmake_file = Path("CMakeLists.txt")
     backup_file = Path("CMakeLists.txt.verdure.bak")
+    suffix = version_suffix if version_suffix is not None else get_verdure_suffix()
     
     # 备份原文件
     shutil.copy2(cmake_file, backup_file)
@@ -71,9 +80,9 @@ def patch_cmake_version(version_suffix: str = VERDURE_SUFFIX) -> None:
             if line.startswith("set(PROJECT_VER"):
                 # 提取原版本号并添加后缀
                 version = line.split("\"")[1]
-                new_line = f'set(PROJECT_VER "{version}{version_suffix}")'
+                new_line = f'set(PROJECT_VER "{version}{suffix}")'
                 new_lines.append(new_line)
-                print(f"[Verdure] 版本号: {version} -> {version}{version_suffix}")
+                print(f"[Verdure] 版本号: {version} -> {version}{suffix}")
             else:
                 new_lines.append(line)
         
@@ -262,7 +271,7 @@ def release(board_type: str, config_filename: str = "config.json", *, filter_nam
 
     # 获取原始版本号
     original_version = get_project_version()
-    verdure_version = f"{original_version}{VERDURE_SUFFIX}"
+    verdure_version = f"{original_version}{get_verdure_suffix()}"
     print(f"[Verdure] Project Version: {verdure_version} ({cfg_path})")
 
     with cfg_path.open() as f:
@@ -302,7 +311,7 @@ def release(board_type: str, config_filename: str = "config.json", *, filter_nam
         os.environ.pop("IDF_TARGET", None)
 
         # 临时修改 CMakeLists.txt 添加 verdure 后缀
-        patch_cmake_version(VERDURE_SUFFIX)
+        patch_cmake_version()
 
         try:
             # Call set-target
@@ -353,11 +362,10 @@ if __name__ == "__main__":
 
     args = parser.parse_args()
 
-    # List mode - 在 JSON 模式下不输出额外信息
+    print(f"[Verdure] 使用 Verdure 定制构建脚本，版本后缀: {get_verdure_suffix()}")
+
+    # List mode
     if args.list_boards:
-        if not args.json:
-            print(f"[Verdure] 使用 Verdure 定制构建脚本，版本后缀: {VERDURE_SUFFIX}")
-        
         variants = _collect_variants(config_filename=args.config)
         if args.json:
             print(json.dumps(variants))
@@ -375,7 +383,7 @@ if __name__ == "__main__":
             sys.exit(1)
         
         # 临时修改版本号
-        patch_cmake_version(VERDURE_SUFFIX)
+        patch_cmake_version()
         try:
             project_ver = get_project_version()
             zip_bin(curr_board_type, project_ver)

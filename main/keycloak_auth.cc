@@ -11,6 +11,10 @@
 
 KeycloakAuth::KeycloakAuth(const std::string& server_url, const std::string& realm, const std::string& client_id)
     : server_url_(server_url), realm_(realm), client_id_(client_id) {
+    // Normalize server URL to avoid double slashes in token/device endpoints.
+    while (!server_url_.empty() && server_url_.back() == '/') {
+        server_url_.pop_back();
+    }
     settings_ = std::make_unique<Settings>("keycloak", true);
     LoadTokens();
 }
@@ -213,6 +217,7 @@ esp_err_t KeycloakAuth::RefreshToken() {
     auto http = Board::GetInstance().GetNetwork()->CreateHttp(30);
     
     std::string url = GetTokenUrl();
+    ESP_LOGI(TAG, "Refreshing token via URL: %s", url.c_str());
     std::string post_data = "grant_type=refresh_token&"
                            "client_id=" + client_id_ + "&"
                            "refresh_token=" + refresh_token_;
@@ -229,13 +234,33 @@ esp_err_t KeycloakAuth::RefreshToken() {
     
     int status_code = http->GetStatusCode();
     if (status_code != 200) {
-        ESP_LOGE(TAG, "Refresh token request failed with status: %d", status_code);
+        std::string error_response = http->ReadAll();
         http->Close();
+        ESP_LOGE(TAG, "Refresh token request failed with status: %d", status_code);
+        ESP_LOGE(TAG, "Refresh error response: %s", error_response.c_str());
+        
+        // Parse error to check if refresh token is expired/revoked
+        cJSON* err_json = cJSON_Parse(error_response.c_str());
+        if (err_json) {
+            cJSON* error = cJSON_GetObjectItem(err_json, "error");
+            if (error && cJSON_IsString(error)) {
+                std::string err_str = error->valuestring;
+                if (err_str == "invalid_grant") {
+                    // Refresh token expired or revoked, clear all tokens
+                    // User needs to re-login via device flow
+                    ESP_LOGW(TAG, "Refresh token expired or revoked (invalid_grant), clearing all tokens");
+                    ClearTokens();
+                }
+            }
+            cJSON_Delete(err_json);
+        }
         return ESP_FAIL;
     }
     
     std::string json_response = http->ReadAll();
     http->Close();
+    
+    ESP_LOGI(TAG, "Token refresh successful");
     
     TokenResponse token_response;
     esp_err_t ret = ParseJsonResponse(json_response, token_response);
@@ -258,14 +283,26 @@ bool KeycloakAuth::IsAuthenticated() {
     
     // 检查access token是否过期（提前60秒刷新）
     if (now >= access_token_expires_at_ - 60) {
-        ESP_LOGI(TAG, "Access token expired or expiring soon");
+        ESP_LOGI(TAG, "Access token expired or expiring soon (expires_at=%lld, now=%lld)",
+                 (long long)access_token_expires_at_, (long long)now);
         
-        // 尝试刷新
-        if (!refresh_token_.empty() && now < refresh_token_expires_at_) {
-            ESP_LOGI(TAG, "Attempting to refresh token");
+        // 尝试使用refresh_token刷新
+        if (!refresh_token_.empty()) {
+            // refresh_token_expires_at_ == 0 表示未知过期时间（如离线token），视为有效并尝试刷新
+            // 否则检查refresh token是否已过期
+            if (refresh_token_expires_at_ > 0 && now >= refresh_token_expires_at_) {
+                ESP_LOGW(TAG, "Refresh token also expired (expires_at=%lld)", (long long)refresh_token_expires_at_);
+                return false;
+            }
+            
+            ESP_LOGI(TAG, "Attempting to refresh access token using refresh_token...");
             if (RefreshToken() == ESP_OK) {
+                ESP_LOGI(TAG, "Access token refreshed successfully via refresh_token");
                 return true;
             }
+            ESP_LOGW(TAG, "Token refresh failed");
+        } else {
+            ESP_LOGW(TAG, "No refresh token available, cannot auto-refresh");
         }
         
         return false;
@@ -283,16 +320,30 @@ std::string KeycloakAuth::GetRefreshToken() {
 }
 
 void KeycloakAuth::SaveTokens(const TokenResponse& token_response) {
-    access_token_ = token_response.access_token;
-    refresh_token_ = token_response.refresh_token;
+    if (!token_response.access_token.empty()) {
+        access_token_ = token_response.access_token;
+    }
+    if (!token_response.refresh_token.empty()) {
+        refresh_token_ = token_response.refresh_token;
+    }
     
     // 计算过期时间戳
     struct timeval tv;
     gettimeofday(&tv, NULL);
     int64_t now = tv.tv_sec;
     
-    access_token_expires_at_ = now + token_response.expires_in;
-    refresh_token_expires_at_ = now + token_response.refresh_expires_in;
+    if (token_response.expires_in > 0) {
+        access_token_expires_at_ = now + token_response.expires_in;
+    } else {
+        access_token_expires_at_ = 0;
+    }
+
+    // refresh_expires_in == 0 from Keycloak means offline/unknown expiry.
+    if (token_response.refresh_expires_in > 0) {
+        refresh_token_expires_at_ = now + token_response.refresh_expires_in;
+    } else {
+        refresh_token_expires_at_ = 0;
+    }
     
     // 保存到NVS
     settings_->EraseKey("access_token");

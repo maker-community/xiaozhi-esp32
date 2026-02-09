@@ -75,6 +75,12 @@ LcdDisplay::LcdDisplay(esp_lcd_panel_io_handle_t panel_io, esp_lcd_panel_handle_
     std::string theme_name = settings.GetString("theme", "light");
     current_theme_ = LvglThemeManager::GetInstance().GetTheme(theme_name);
 
+    int preview_duration = settings.GetInt("preview_image_duration_ms", PREVIEW_IMAGE_DURATION_MS);
+    if (preview_duration <= 0) {
+        preview_duration = PREVIEW_IMAGE_DURATION_MS;
+    }
+    preview_duration_ms_ = preview_duration;
+
     // Create a timer to hide the preview image
     esp_timer_create_args_t preview_timer_args = {
         .callback = [](void* arg) {
@@ -736,8 +742,8 @@ void LcdDisplay::SetPreviewImage(std::unique_ptr<LvglImage> image) {
     lv_obj_t* preview_image = lv_image_create(img_bubble);
     
     // Calculate appropriate size for the image
-    lv_coord_t max_width = LV_HOR_RES * 70 / 100;  // 70% of screen width
-    lv_coord_t max_height = LV_VER_RES * 50 / 100; // 50% of screen height
+    lv_coord_t max_width = LV_HOR_RES * 90 / 100;  // 90% of screen width
+    lv_coord_t max_height = LV_VER_RES * 80 / 100; // 80% of screen height
     
     // Calculate zoom factor to fit within maximum dimensions
     auto img_dsc = image->image_dsc();
@@ -753,8 +759,10 @@ void LcdDisplay::SetPreviewImage(std::unique_ptr<LvglImage> image) {
     lv_coord_t zoom_h = (max_height * 256) / img_height;
     lv_coord_t zoom = (zoom_w < zoom_h) ? zoom_w : zoom_h;
     
-    // Ensure zoom doesn't exceed 256 (100%)
-    if (zoom > 256) zoom = 256;
+    const lv_coord_t max_zoom = 1024; // Allow up to 4x upscale for large screens
+    if (zoom > max_zoom) {
+        zoom = max_zoom;
+    }
     
     // Set image properties
     lv_image_set_src(preview_image, img_dsc);
@@ -1010,8 +1018,16 @@ void LcdDisplay::SetPreviewImage(std::unique_ptr<LvglImage> image) {
     auto img_dsc = preview_image_cached_->image_dsc();
     lv_image_set_src(preview_image_, img_dsc);
     if (img_dsc->header.w > 0 && img_dsc->header.h > 0) {
-        // zoom factor 0.5
-        lv_image_set_scale(preview_image_, 128 * width_ / img_dsc->header.w);
+        lv_coord_t max_width = LV_HOR_RES;
+        lv_coord_t max_height = LV_VER_RES;
+        lv_coord_t zoom_w = (max_width * 256) / img_dsc->header.w;
+        lv_coord_t zoom_h = (max_height * 256) / img_dsc->header.h;
+        lv_coord_t zoom = (zoom_w < zoom_h) ? zoom_w : zoom_h;
+        const lv_coord_t max_zoom = 1024; // Allow up to 4x upscale for large screens
+        if (zoom > max_zoom) {
+            zoom = max_zoom;
+        }
+        lv_image_set_scale(preview_image_, zoom);
     }
 
     // Hide emoji_box_
@@ -1020,8 +1036,10 @@ void LcdDisplay::SetPreviewImage(std::unique_ptr<LvglImage> image) {
     }
     lv_obj_add_flag(emoji_box_, LV_OBJ_FLAG_HIDDEN);
     lv_obj_remove_flag(preview_image_, LV_OBJ_FLAG_HIDDEN);
+    lv_obj_center(preview_image_);
+    lv_obj_move_foreground(preview_image_);
     esp_timer_stop(preview_timer_);
-    ESP_ERROR_CHECK(esp_timer_start_once(preview_timer_, PREVIEW_IMAGE_DURATION_MS * 1000));
+    ESP_ERROR_CHECK(esp_timer_start_once(preview_timer_, static_cast<uint64_t>(preview_duration_ms_) * 1000));
 }
 
 void LcdDisplay::SetChatMessage(const char* role, const char* content) {
