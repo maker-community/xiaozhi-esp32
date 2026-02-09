@@ -11,6 +11,10 @@
 
 KeycloakAuth::KeycloakAuth(const std::string& server_url, const std::string& realm, const std::string& client_id)
     : server_url_(server_url), realm_(realm), client_id_(client_id) {
+    // Normalize server URL to avoid double slashes in token/device endpoints.
+    while (!server_url_.empty() && server_url_.back() == '/') {
+        server_url_.pop_back();
+    }
     settings_ = std::make_unique<Settings>("keycloak", true);
     LoadTokens();
 }
@@ -213,6 +217,7 @@ esp_err_t KeycloakAuth::RefreshToken() {
     auto http = Board::GetInstance().GetNetwork()->CreateHttp(30);
     
     std::string url = GetTokenUrl();
+    ESP_LOGI(TAG, "Refreshing token via URL: %s", url.c_str());
     std::string post_data = "grant_type=refresh_token&"
                            "client_id=" + client_id_ + "&"
                            "refresh_token=" + refresh_token_;
