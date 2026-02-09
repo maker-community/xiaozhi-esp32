@@ -12,7 +12,7 @@ permissions:
   contents: read
 
 env:
-  VERDURE_SUBVER: ""
+  VERDURE_SUBVER: "1"
 
 jobs:
   prepare:
