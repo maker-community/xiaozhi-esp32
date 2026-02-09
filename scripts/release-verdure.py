@@ -361,9 +361,7 @@ if __name__ == "__main__":
 
     args = parser.parse_args()
 
-    print(f"[Verdure] 使用 Verdure 定制构建脚本，版本后缀: {get_verdure_suffix()}")
-
-    # List mode
+    # List mode — must output clean JSON to stdout, no extra prints
     if args.list_boards:
         variants = _collect_variants(config_filename=args.config)
         if args.json:
@@ -372,6 +370,8 @@ if __name__ == "__main__":
             for v in variants:
                 print(f"{v['board']}: {v['name']}")
         sys.exit(0)
+
+    print(f"[Verdure] 使用 Verdure 定制构建脚本，版本后缀: {get_verdure_suffix()}")
 
     # Current directory firmware packaging mode
     if args.board is None:
