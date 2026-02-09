@@ -91,7 +91,7 @@ jobs:
     strategy:
       fail-fast: false  # 单个变体失败不影响其它变体
       matrix:
-        include: ${{ fromJson(needs.prepare.outputs.variants) }}
+        include: ${{ fromJson(needs.prepare.outputs.variants || '[]') }}
     runs-on: ubuntu-latest
     container:
       image: espressif/idf:v5.5.2
