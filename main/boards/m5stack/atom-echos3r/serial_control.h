@@ -1,5 +1,6 @@
 #pragma once
 
+#include <driver/gpio.h>
 #include <driver/uart.h>
 #include <freertos/FreeRTOS.h>
 #include <freertos/semphr.h>

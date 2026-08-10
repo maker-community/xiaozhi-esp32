@@ -14,8 +14,10 @@
 #include <esp_lcd_panel_ops.h>
 #include <esp_lcd_panel_vendor.h>
 #include <esp_log.h>
+#include <freertos/task.h>
 
 #include <cstdio>
+#include <cstdlib>
 
 #define TAG "AtomEchoS3R"
 

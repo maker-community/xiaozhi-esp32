@@ -2,6 +2,8 @@
 
 #include <esp_log.h>
 
+#include <cstring>
+
 #define TAG "SerialControl"
 
 SerialControl::SerialControl(uart_port_t uart_num, gpio_num_t tx_pin, gpio_num_t rx_pin, int baud,
