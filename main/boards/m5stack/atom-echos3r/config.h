@@ -38,15 +38,17 @@
 #define DISPLAY_SPI_MODE 0
 
 #define LCD_TYPE_ST7789_SERIAL
-#define DISPLAY_WIDTH 172
-#define DISPLAY_HEIGHT 320
-#define DISPLAY_MIRROR_X false
+// 横屏 320x172（swap_xy 把 172x320 竖屏面板旋转为横屏）
+#define DISPLAY_WIDTH 320
+#define DISPLAY_HEIGHT 172
+#define DISPLAY_MIRROR_X true
 #define DISPLAY_MIRROR_Y false
-#define DISPLAY_SWAP_XY false
+#define DISPLAY_SWAP_XY true
 #define DISPLAY_INVERT_COLOR true
-#define DISPLAY_RGB_ORDER LCD_RGB_ELEMENT_ORDER_BGR
-#define DISPLAY_OFFSET_X 34
-#define DISPLAY_OFFSET_Y 0
+#define DISPLAY_RGB_ORDER LCD_RGB_ELEMENT_ORDER_RGB
+// ST7789 GRAM 240x320，横屏后宽(320)用满 GRAM 高，高(172)对应 GRAM 宽居中段
+#define DISPLAY_OFFSET_X 0
+#define DISPLAY_OFFSET_Y 34
 #define DISPLAY_BACKLIGHT_OUTPUT_INVERT false
 
 // ---- Serial command control (Grove G1/G2 = GPIO1/GPIO2) ----
