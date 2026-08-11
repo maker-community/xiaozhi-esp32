@@ -34,6 +34,21 @@ void SerialControl::SetHelpHandler(std::function<void()> handler) {
     help_handler_ = std::move(handler);
 }
 
+void SerialControl::FlushInput() {
+    // Drain whatever is already buffered in the UART RX ring buffer.
+    uint8_t tmp[64];
+    size_t n = 0;
+    while (uart_read_bytes(uart_num_, tmp, sizeof(tmp), 0) > 0) {
+        n += sizeof(tmp);
+        if (n > 4096) {
+            break;
+        }
+    }
+    if (n > 0) {
+        ESP_LOGI(TAG, "Flushed %u bytes of stale input", (unsigned)n);
+    }
+}
+
 void SerialControl::Start() {
     // Install UART driver (RX ping-pong ring buffer, TX ring buffer).
     uart_config_t uart_config = {

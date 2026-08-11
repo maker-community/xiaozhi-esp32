@@ -52,8 +52,29 @@
 #define DISPLAY_BACKLIGHT_OUTPUT_INVERT false
 
 // ---- Serial command control (Grove G1/G2 = GPIO1/GPIO2) ----
+// 下位机: ESP32-C3 电机板 (esp32c3_kb_motor.ino, DRV8833 + BQ27220 + RGB)
 #define SERIAL_CONTROL_TX_PIN GPIO_NUM_1  // G1
 #define SERIAL_CONTROL_RX_PIN GPIO_NUM_2  // G2
 #define SERIAL_CONTROL_BAUD 115200
+
+// ---- Chassis / Light / Battery (与下位机协议对应) ----
+#define MOTOR_SPEED_MAX 100
+#define MOTOR_SPEED_80 80
+#define MOTOR_SPEED_60 60
+#define MOTOR_SPEED_MIN 0
+// MCP 速度(0-100) -> 下位机 PWM(0-255) 缩放
+#define MOTOR_PWM_SCALE(x) (((x) * 255) / 100)
+
+// 下位机主动上报电池周期(ms), 上位机也按其节奏轮询
+#define BATTERY_QUERY_INTERVAL_MS 5000
+
+// ---- 上电时序加固: 上下位机共电源复位不同步 ----
+// 上位机启动后延迟多久才开始与下位机通信(ms)。
+// 下位机 setup() 含 BLE 键盘/BQ27220 初始化, 可能耗时数秒, 需留足时间。
+#define MOTOR_BOARD_STARTUP_DELAY_MS 8000
+// 发送关键命令前用 ping 探活, 失败等待间隔(ms)
+#define MOTOR_BOARD_PING_RETRY_MS 1000
+// 等待下位机 READY 的最大探活次数 (超过则强制继续, 避免永久卡住)
+#define MOTOR_BOARD_READY_MAX_PINGS 25
 
 #endif  // _BOARD_CONFIG_H_

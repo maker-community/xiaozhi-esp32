@@ -39,6 +39,10 @@ public:
     /// Start the receive task.
     void Start();
 
+    /// Discard any buffered / in-flight input (e.g. garbage received while the
+    /// peer was still resetting). Safe to call before/after Start().
+    void FlushInput();
+
     /// Send a single line (adds \r\n). Thread-safe.
     void SendLine(const std::string& line);
 
