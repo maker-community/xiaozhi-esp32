@@ -29,7 +29,7 @@
 class AtomEchoS3rBaseBoard : public WifiBoard {
 private:
     i2c_master_bus_handle_t i2c_bus_;
-    Button boot_button_;
+    Button user_button_;
     LcdDisplay* display_ = nullptr;
     SerialControl serial_;  // Grove 口 -> 下位机 ESP32-C3 电机板
 
@@ -42,7 +42,6 @@ private:
     uint8_t rgb_[3] = {0, 0, 0};
     esp_timer_handle_t battery_timer_ = nullptr;
     volatile bool motor_board_ready_ = false;  // 收到 READY / 首个有效响应后置位
-    volatile bool button_stop_handled_ = false;
 
     void InitializeI2c() {
         // Initialize I2C peripheral
@@ -131,7 +130,7 @@ private:
     }
 
     void InitializeButtons() {
-        boot_button_.OnPressDown([this]() {
+        user_button_.OnPressDown([this]() {
             bool moving = false;
             {
                 std::lock_guard<std::mutex> lock(motor_mutex_);
@@ -148,15 +147,10 @@ private:
                 motor_speed_[0] = 0;
                 motor_speed_[1] = 0;
             }
-            button_stop_handled_ = true;
             ESP_LOGI(TAG, "[BUTTON] emergency stop");
         });
 
-        boot_button_.OnClick([this]() {
-            if (button_stop_handled_) {
-                button_stop_handled_ = false;
-                return;
-            }
+        user_button_.OnClick([this]() {
             auto& app = Application::GetInstance();
             if (app.GetDeviceState() == kDeviceStateStarting) {
                 EnterWifiConfigMode();
@@ -649,7 +643,7 @@ private:
 
 public:
     AtomEchoS3rBaseBoard()
-        : boot_button_(USER_BUTTON_GPIO),
+        : user_button_(USER_BUTTON_GPIO),
           serial_(UART_NUM_1, SERIAL_CONTROL_TX_PIN, SERIAL_CONTROL_RX_PIN, SERIAL_CONTROL_BAUD) {
         InitializeI2c();
         I2cDetect();
