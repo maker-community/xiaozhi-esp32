@@ -19,6 +19,7 @@
 #include <freertos/task.h>
 
 #include <cJSON.h>
+#include <algorithm>
 #include <cstdio>
 #include <cstdlib>
 #include <mutex>
@@ -41,6 +42,7 @@ private:
     uint8_t rgb_[3] = {0, 0, 0};
     esp_timer_handle_t battery_timer_ = nullptr;
     volatile bool motor_board_ready_ = false;  // 收到 READY / 首个有效响应后置位
+    volatile bool button_stop_handled_ = false;
 
     void InitializeI2c() {
         // Initialize I2C peripheral
@@ -129,7 +131,32 @@ private:
     }
 
     void InitializeButtons() {
+        boot_button_.OnPressDown([this]() {
+            bool moving = false;
+            {
+                std::lock_guard<std::mutex> lock(motor_mutex_);
+                moving = motor_speed_[0] != 0 || motor_speed_[1] != 0;
+            }
+            if (!moving) {
+                return;
+            }
+
+            // 急停不等待 READY 握手，保证按钮按下后立即把停止命令发出。
+            serial_.SendLine("stop");
+            {
+                std::lock_guard<std::mutex> lock(motor_mutex_);
+                motor_speed_[0] = 0;
+                motor_speed_[1] = 0;
+            }
+            button_stop_handled_ = true;
+            ESP_LOGI(TAG, "[BUTTON] emergency stop");
+        });
+
         boot_button_.OnClick([this]() {
+            if (button_stop_handled_) {
+                button_stop_handled_ = false;
+                return;
+            }
             auto& app = Application::GetInstance();
             if (app.GetDeviceState() == kDeviceStateStarting) {
                 EnterWifiConfigMode();
@@ -188,20 +215,15 @@ private:
         serial_.SendLine(buf);
     }
 
-    void DriveMotors(int left, int right) {  // left/right: -100..100
-        ESP_LOGI(TAG, "[CHASSIS] DriveMotors left=%d right=%d", left, right);
-        if (left == 0) {
-            SendMotorCommand(0, "stop", 0);
-        } else {
-            SendMotorCommand(0, left > 0 ? "fwd" : "rev", abs(left));
-        }
-        // 两条命令间隔 20ms, 避免下位机串口缓冲粘包导致解析错位
-        vTaskDelay(pdMS_TO_TICKS(20));
-        if (right == 0) {
-            SendMotorCommand(1, "stop", 0);
-        } else {
-            SendMotorCommand(1, right > 0 ? "fwd" : "rev", abs(right));
-        }
+    void DriveMotors(int left, int right) {  // left/right: -40..40
+        left = std::max(-MOTOR_SPEED_MAX, std::min(MOTOR_SPEED_MAX, left));
+        right = std::max(-MOTOR_SPEED_MAX, std::min(MOTOR_SPEED_MAX, right));
+        EnsureMotorBoardReady();
+        char buf[64];
+        snprintf(buf, sizeof(buf), "drive %d %d", left, right);
+        ESP_LOGI(TAG, "[CHASSIS] %s", buf);
+        // 新协议将左右轮作为一个原子命令发送, 避免两条 motor 命令不同步。
+        serial_.SendLine(buf);
         {
             std::lock_guard<std::mutex> lock(motor_mutex_);
             motor_speed_[0] = left;
@@ -239,6 +261,42 @@ private:
         snprintf(buf, sizeof(buf), "rgb %d %d %d", r, g, b);
         ESP_LOGI(TAG, "[UART TX] %s", buf);
         serial_.SendLine(buf);
+    }
+
+    void SetLedMode(const std::string& mode, int r = 0, int g = 0, int b = 0,
+                    int period_ms = 1000) {
+        EnsureMotorBoardReady();
+        r = std::max(0, std::min(255, r));
+        g = std::max(0, std::min(255, g));
+        b = std::max(0, std::min(255, b));
+        period_ms = std::max(100, std::min(10000, period_ms));
+
+        char buf[96];
+        if (mode == "on" || mode == "off") {
+            snprintf(buf, sizeof(buf), "led %s", mode.c_str());
+        } else if (mode == "rgb") {
+            snprintf(buf, sizeof(buf), "rgb %d %d %d", r, g, b);
+        } else {
+            snprintf(buf, sizeof(buf), "led %s %d %d %d %d", mode.c_str(), r, g, b, period_ms);
+        }
+        ESP_LOGI(TAG, "[UART TX] %s", buf);
+        serial_.SendLine(buf);
+
+        if (mode == "off") {
+            std::lock_guard<std::mutex> lock(motor_mutex_);
+            rgb_[0] = rgb_[1] = rgb_[2] = 0;
+        } else if (mode == "rgb") {
+            std::lock_guard<std::mutex> lock(motor_mutex_);
+            rgb_[0] = static_cast<uint8_t>(r);
+            rgb_[1] = static_cast<uint8_t>(g);
+            rgb_[2] = static_cast<uint8_t>(b);
+        }
+    }
+
+    void SetLedEmotion(const std::string& emotion) {
+        EnsureMotorBoardReady();
+        ESP_LOGI(TAG, "[UART TX] led emotion %s", emotion.c_str());
+        serial_.SendLine("led emotion " + emotion);
     }
 
     // 解析下位机回报行: battery level=.. charging=.. discharging=..
@@ -505,91 +563,87 @@ private:
         }
     }
 
-    // ---- MCP 工具: 小车功能 (参考 esp-sparkbot_board.cc) ----
+    // ---- MCP 工具: 使用少量高语义工具覆盖小车协议 ----
     void InitializeTools() {
         auto& mcp_server = McpServer::GetInstance();
 
-        mcp_server.AddTool("self.chassis.go_forward", "小车前进 (差速驱动两个电机向前)",
-                           PropertyList({Property("speed", kPropertyTypeInteger, MOTOR_SPEED_80,
-                                                  MOTOR_SPEED_MIN, MOTOR_SPEED_MAX)}),
-                           [this](const PropertyList& properties) -> ReturnValue {
-                               int speed = properties["speed"].value<int>();
-                               ESP_LOGI(TAG, "[MCP] go_forward speed=%d", speed);
-                               DriveMotors(speed, speed);
-                               return true;
-                           });
-
-        mcp_server.AddTool("self.chassis.go_back", "小车后退 (差速驱动两个电机向后)",
-                           PropertyList({Property("speed", kPropertyTypeInteger, MOTOR_SPEED_80,
-                                                  MOTOR_SPEED_MIN, MOTOR_SPEED_MAX)}),
-                           [this](const PropertyList& properties) -> ReturnValue {
-                               int speed = properties["speed"].value<int>();
-                               ESP_LOGI(TAG, "[MCP] go_back speed=%d", speed);
-                               DriveMotors(-speed, -speed);
-                               return true;
-                           });
-
-        mcp_server.AddTool("self.chassis.turn_left", "小车原地左转 (左右电机反向)",
-                           PropertyList({Property("speed", kPropertyTypeInteger, MOTOR_SPEED_60,
-                                                  MOTOR_SPEED_MIN, MOTOR_SPEED_MAX)}),
-                           [this](const PropertyList& properties) -> ReturnValue {
-                               int speed = properties["speed"].value<int>();
-                               ESP_LOGI(TAG, "[MCP] turn_left speed=%d", speed);
-                               DriveMotors(-speed, speed);
-                               return true;
-                           });
-
-        mcp_server.AddTool("self.chassis.turn_right", "小车原地右转 (左右电机反向)",
-                           PropertyList({Property("speed", kPropertyTypeInteger, MOTOR_SPEED_60,
-                                                  MOTOR_SPEED_MIN, MOTOR_SPEED_MAX)}),
-                           [this](const PropertyList& properties) -> ReturnValue {
-                               int speed = properties["speed"].value<int>();
-                               ESP_LOGI(TAG, "[MCP] turn_right speed=%d", speed);
-                               DriveMotors(speed, -speed);
-                               return true;
-                           });
-
-        mcp_server.AddTool("self.chassis.stop", "小车停止 (两个电机停止)", PropertyList(),
-                           [this](const PropertyList& properties) -> ReturnValue {
-                               ESP_LOGI(TAG, "[MCP] stop");
-                               DriveMotors(0, 0);
-                               return true;
-                           });
-
         mcp_server.AddTool(
-            "self.chassis.get_status", "获取小车状态 (电机速度 / RGB 灯光 / 电池电量)",
-            PropertyList(), [this](const PropertyList& properties) -> ReturnValue {
-                ESP_LOGI(TAG, "[MCP] get_status");
-                QueryBattery();
-                std::lock_guard<std::mutex> lock(motor_mutex_);
-                char buf[128];
-                snprintf(
-                    buf, sizeof(buf),
-                    "{\"motor\":{\"m0\":%d,\"m1\":%d},\"rgb\":[%d,%d,%d],\"battery\":{\"level\":%d,"
-                    "\"charging\":%d,\"discharging\":%d}}",
-                    motor_speed_[0], motor_speed_[1], rgb_[0], rgb_[1], rgb_[2], battery_level_,
-                    battery_charging_ ? 1 : 0, battery_discharging_ ? 1 : 0);
-                return std::string(buf);
+            "self.rover.action",
+            "控制小车动作。action 可选 forward、back、turn_left、turn_right、stop；speed 为 0-40 "
+            "的安全百分比。",
+            PropertyList({Property("action", kPropertyTypeString, "stop"),
+                          Property("speed", kPropertyTypeInteger, MOTOR_SPEED_DEFAULT,
+                                   MOTOR_SPEED_MIN, MOTOR_SPEED_MAX)}),
+            [this](const PropertyList& properties) -> ReturnValue {
+                std::string action = ToLower(properties["action"].value<std::string>());
+                int speed = properties["speed"].value<int>();
+                ESP_LOGI(TAG, "[MCP] rover.action action=%s speed=%d", action.c_str(), speed);
+
+                if (action == "forward") {
+                    DriveMotors(speed, speed);
+                } else if (action == "back") {
+                    DriveMotors(-speed, -speed);
+                } else if (action == "turn_left") {
+                    DriveMotors(-speed, speed);
+                } else if (action == "turn_right") {
+                    DriveMotors(speed, -speed);
+                } else if (action == "stop") {
+                    DriveMotors(0, 0);
+                } else {
+                    return std::string("Unsupported action: ") + action;
+                }
+                return true;
             });
 
-        mcp_server.AddTool("self.led.set_color", "设置小车 RGB 灯光颜色",
-                           PropertyList({Property("red", kPropertyTypeInteger, 0, 0, 255),
-                                         Property("green", kPropertyTypeInteger, 0, 0, 255),
-                                         Property("blue", kPropertyTypeInteger, 0, 0, 255)}),
-                           [this](const PropertyList& properties) -> ReturnValue {
-                               int r = properties["red"].value<int>();
-                               int g = properties["green"].value<int>();
-                               int b = properties["blue"].value<int>();
-                               ESP_LOGI(TAG, "[MCP] set_color rgb=(%d,%d,%d)", r, g, b);
-                               SetRgb(r, g, b);
-                               return true;
-                           });
+        mcp_server.AddTool(
+            "self.rover.light",
+            "控制小车灯光。mode 可选 off、on、rgb、breathe、blink、emotion；emotion 可选 "
+            "happy、listening、thinking、charging、working、warning、error、off。",
+            PropertyList({Property("mode", kPropertyTypeString, "off"),
+                          Property("emotion", kPropertyTypeString, "off"),
+                          Property("red", kPropertyTypeInteger, 0, 0, 255),
+                          Property("green", kPropertyTypeInteger, 0, 0, 255),
+                          Property("blue", kPropertyTypeInteger, 0, 0, 255),
+                          Property("period_ms", kPropertyTypeInteger, 1000, 100, 10000)}),
+            [this](const PropertyList& properties) -> ReturnValue {
+                std::string mode = ToLower(properties["mode"].value<std::string>());
+                std::string emotion = ToLower(properties["emotion"].value<std::string>());
+                int r = properties["red"].value<int>();
+                int g = properties["green"].value<int>();
+                int b = properties["blue"].value<int>();
+                int period = properties["period_ms"].value<int>();
+                ESP_LOGI(TAG, "[MCP] rover.light mode=%s emotion=%s rgb=(%d,%d,%d) period=%d",
+                         mode.c_str(), emotion.c_str(), r, g, b, period);
 
-        mcp_server.AddTool("self.led.off", "关闭小车 RGB 灯光", PropertyList(),
-                           [this](const PropertyList& properties) -> ReturnValue {
-                               ESP_LOGI(TAG, "[MCP] led.off");
-                               SetRgb(0, 0, 0);
-                               return true;
+                if (mode == "emotion") {
+                    SetLedEmotion(emotion);
+                } else if (mode == "off" || mode == "on" || mode == "rgb" || mode == "breathe" ||
+                           mode == "blink") {
+                    SetLedMode(mode, r, g, b, period);
+                } else {
+                    return std::string("Unsupported light mode: ") + mode;
+                }
+                return true;
+            });
+
+        mcp_server.AddTool("self.rover.get_status",
+                           "获取小车实时状态，包括电机、电池、灯光、速度限制和 BLE 状态。",
+                           PropertyList(), [this](const PropertyList& properties) -> ReturnValue {
+                               ESP_LOGI(TAG, "[MCP] rover.get_status");
+                               EnsureMotorBoardReady();
+                               serial_.SendLine("status");
+                               QueryBattery();
+                               std::lock_guard<std::mutex> lock(motor_mutex_);
+                               char buf[192];
+                               snprintf(
+                                   buf, sizeof(buf),
+                                   "{\"motor\":{\"m0\":%d,\"m1\":%d},\"rgb\":[%d,%d,%d],"
+                                   "\"battery\":{\"level\":%d,\"charging\":%d,\"discharging\":%d},"
+                                   "\"speed_limit\":%d}",
+                                   motor_speed_[0], motor_speed_[1], rgb_[0], rgb_[1], rgb_[2],
+                                   battery_level_, battery_charging_ ? 1 : 0,
+                                   battery_discharging_ ? 1 : 0, MOTOR_SPEED_MAX);
+                               return std::string(buf);
                            });
     }
 

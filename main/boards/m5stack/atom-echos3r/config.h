@@ -58,9 +58,8 @@
 #define SERIAL_CONTROL_BAUD 115200
 
 // ---- Chassis / Light / Battery (与下位机协议对应) ----
-#define MOTOR_SPEED_MAX 100
-#define MOTOR_SPEED_80 80
-#define MOTOR_SPEED_60 60
+#define MOTOR_SPEED_MAX 40
+#define MOTOR_SPEED_DEFAULT 30
 #define MOTOR_SPEED_MIN 0
 // MCP 速度(0-100) -> 下位机 PWM(0-255) 缩放
 #define MOTOR_PWM_SCALE(x) (((x) * 255) / 100)
