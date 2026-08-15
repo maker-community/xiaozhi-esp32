@@ -7,6 +7,7 @@
 #include <freertos/task.h>
 
 #include <functional>
+#include <mutex>
 #include <string>
 
 /**
@@ -46,6 +47,10 @@ public:
     /// Send a single line (adds \r\n). Thread-safe.
     void SendLine(const std::string& line);
 
+    /// Send one command and wait for a response with the requested prefix or ERR.
+    bool SendCommand(const std::string& line, const std::string& response_prefix,
+                     std::string& response, uint32_t timeout_ms = 1000);
+
     /// Called once per received command line (without trailing newline).
     void SetLineHandler(std::function<void(const std::string& line)> handler);
 
@@ -64,6 +69,12 @@ private:
     size_t line_buf_size_;
     TaskHandle_t task_handle_ = nullptr;
     SemaphoreHandle_t tx_mutex_ = nullptr;
+    SemaphoreHandle_t command_mutex_ = nullptr;
+    SemaphoreHandle_t response_ready_ = nullptr;
+    std::mutex response_mutex_;
+    bool response_waiting_ = false;
+    std::string response_prefix_;
+    std::string response_line_;
     std::function<void(const std::string&)> line_handler_;
     std::function<void()> help_handler_;
 };

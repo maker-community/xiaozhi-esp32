@@ -23,6 +23,14 @@ SerialControl::~SerialControl() {
         vSemaphoreDelete(tx_mutex_);
         tx_mutex_ = nullptr;
     }
+    if (command_mutex_ != nullptr) {
+        vSemaphoreDelete(command_mutex_);
+        command_mutex_ = nullptr;
+    }
+    if (response_ready_ != nullptr) {
+        vSemaphoreDelete(response_ready_);
+        response_ready_ = nullptr;
+    }
     uart_driver_delete(uart_num_);
 }
 
@@ -66,6 +74,8 @@ void SerialControl::Start() {
         uart_driver_install(uart_num_, line_buf_size_ * 2, line_buf_size_ * 2, 0, nullptr, 0));
 
     tx_mutex_ = xSemaphoreCreateMutex();
+    command_mutex_ = xSemaphoreCreateMutex();
+    response_ready_ = xSemaphoreCreateBinary();
 
     BaseType_t ret = xTaskCreate(TaskEntry, "serial_control", 4096, this, 5, &task_handle_);
     if (ret != pdPASS) {
@@ -125,6 +135,16 @@ void SerialControl::HandleLine(std::string& line) {
     }
     ESP_LOGI(TAG, "cmd: %s", line.c_str());
 
+    {
+        std::lock_guard<std::mutex> lock(response_mutex_);
+        if (response_waiting_ &&
+            (line.rfind(response_prefix_, 0) == 0 || line.rfind("ERR ", 0) == 0)) {
+            response_line_ = line;
+            response_waiting_ = false;
+            xSemaphoreGive(response_ready_);
+        }
+    }
+
     if (line == "help" || line == "?") {
         if (help_handler_) {
             help_handler_();
@@ -148,4 +168,34 @@ void SerialControl::SendLine(const std::string& line) {
     } else {
         uart_write_bytes(uart_num_, out.c_str(), out.size());
     }
+}
+
+bool SerialControl::SendCommand(const std::string& line, const std::string& response_prefix,
+                                std::string& response, uint32_t timeout_ms) {
+    if (command_mutex_ == nullptr || response_ready_ == nullptr) {
+        return false;
+    }
+
+    xSemaphoreTake(command_mutex_, portMAX_DELAY);
+    xSemaphoreTake(response_ready_, 0);
+    {
+        std::lock_guard<std::mutex> lock(response_mutex_);
+        response_prefix_ = response_prefix;
+        response_line_.clear();
+        response_waiting_ = true;
+    }
+
+    SendLine(line);
+    bool received = xSemaphoreTake(response_ready_, pdMS_TO_TICKS(timeout_ms)) == pdTRUE;
+    {
+        std::lock_guard<std::mutex> lock(response_mutex_);
+        response_waiting_ = false;
+        if (received) {
+            response = response_line_;
+        } else {
+            response.clear();
+        }
+    }
+    xSemaphoreGive(command_mutex_);
+    return received && response.rfind("ERR ", 0) != 0;
 }

@@ -22,9 +22,31 @@
 #include <algorithm>
 #include <cstdio>
 #include <cstdlib>
+#include <functional>
 #include <mutex>
+#include <utility>
 
 #define TAG "AtomEchoS3R"
+
+class RoverLcdDisplay : public SpiLcdDisplay {
+public:
+    RoverLcdDisplay(esp_lcd_panel_io_handle_t panel_io, esp_lcd_panel_handle_t panel, int width,
+                    int height, int offset_x, int offset_y, bool mirror_x, bool mirror_y,
+                    bool swap_xy, std::function<void(const char*)> emotion_handler)
+        : SpiLcdDisplay(panel_io, panel, width, height, offset_x, offset_y, mirror_x, mirror_y,
+                        swap_xy),
+          emotion_handler_(std::move(emotion_handler)) {}
+
+    void SetEmotion(const char* emotion) override {
+        SpiLcdDisplay::SetEmotion(emotion);
+        if (emotion != nullptr && emotion_handler_) {
+            emotion_handler_(emotion);
+        }
+    }
+
+private:
+    std::function<void(const char*)> emotion_handler_;
+};
 
 class AtomEchoS3rBaseBoard : public WifiBoard {
 private:
@@ -124,9 +146,25 @@ private:
 
         // NOTE: offset/gap is handled by SpiLcdDisplay via lv_display_set_offset;
         // do NOT also call esp_lcd_panel_set_gap here or the image is shifted twice.
-        display_ = new SpiLcdDisplay(panel_io, panel, DISPLAY_WIDTH, DISPLAY_HEIGHT,
-                                     DISPLAY_OFFSET_X, DISPLAY_OFFSET_Y, DISPLAY_MIRROR_X,
-                                     DISPLAY_MIRROR_Y, DISPLAY_SWAP_XY);
+        display_ = new RoverLcdDisplay(
+            panel_io, panel, DISPLAY_WIDTH, DISPLAY_HEIGHT, DISPLAY_OFFSET_X, DISPLAY_OFFSET_Y,
+            DISPLAY_MIRROR_X, DISPLAY_MIRROR_Y, DISPLAY_SWAP_XY, [this](const char* emotion) {
+                std::string value = ToLower(emotion);
+                if (value == "happy" || value == "laughing" || value == "loving" ||
+                    value == "winking" || value == "cool" || value == "relaxed" ||
+                    value == "delicious" || value == "kissy" || value == "confident" ||
+                    value == "silly") {
+                    value = "happy";
+                } else if (value == "thinking" || value == "confused") {
+                    value = "thinking";
+                } else if (value == "sad" || value == "angry" || value == "crying" ||
+                           value == "embarrassed" || value == "surprised" || value == "shocked") {
+                    value = "warning";
+                } else {
+                    value = "off";
+                }
+                SetLedEmotion(value);
+            });
     }
 
     void InitializeButtons() {
@@ -209,20 +247,41 @@ private:
         serial_.SendLine(buf);
     }
 
-    void DriveMotors(int left, int right) {  // left/right: -40..40
-        left = std::max(-MOTOR_SPEED_MAX, std::min(MOTOR_SPEED_MAX, left));
-        right = std::max(-MOTOR_SPEED_MAX, std::min(MOTOR_SPEED_MAX, right));
+    bool DriveAction(const std::string& action, int speed) {
+        speed = std::max(MOTOR_SPEED_MIN, std::min(MOTOR_SPEED_MAX, speed));
         EnsureMotorBoardReady();
-        char buf[64];
-        snprintf(buf, sizeof(buf), "drive %d %d", left, right);
-        ESP_LOGI(TAG, "[CHASSIS] %s", buf);
-        // 新协议将左右轮作为一个原子命令发送, 避免两条 motor 命令不同步。
-        serial_.SendLine(buf);
-        {
-            std::lock_guard<std::mutex> lock(motor_mutex_);
-            motor_speed_[0] = left;
-            motor_speed_[1] = right;
+
+        char command[48];
+        int left = 0;
+        int right = 0;
+        if (action == "forward") {
+            snprintf(command, sizeof(command), "forward %d", speed);
+            left = right = speed;
+        } else if (action == "back") {
+            snprintf(command, sizeof(command), "back %d", speed);
+            left = right = -speed;
+        } else if (action == "turn_left") {
+            snprintf(command, sizeof(command), "turn left %d", speed);
+            left = -speed;
+            right = speed;
+        } else if (action == "turn_right") {
+            snprintf(command, sizeof(command), "turn right %d", speed);
+            left = speed;
+            right = -speed;
+        } else {
+            snprintf(command, sizeof(command), "stop");
         }
+
+        ESP_LOGI(TAG, "[CHASSIS] %s", command);
+        std::string response;
+        if (!serial_.SendCommand(command, "OK drive", response)) {
+            ESP_LOGW(TAG, "[CHASSIS] command failed or timed out: %s", command);
+            return false;
+        }
+        std::lock_guard<std::mutex> lock(motor_mutex_);
+        motor_speed_[0] = left;
+        motor_speed_[1] = right;
+        return true;
     }
 
     // 直接发 battery 查询 (无阻塞, 可在 esp_timer 回调中调用)
@@ -257,13 +316,13 @@ private:
         serial_.SendLine(buf);
     }
 
-    void SetLedMode(const std::string& mode, int r = 0, int g = 0, int b = 0,
+    bool SetLedMode(const std::string& mode, int r = 0, int g = 0, int b = 0,
                     int period_ms = 1000) {
         EnsureMotorBoardReady();
         r = std::max(0, std::min(255, r));
         g = std::max(0, std::min(255, g));
         b = std::max(0, std::min(255, b));
-        period_ms = std::max(100, std::min(10000, period_ms));
+        period_ms = std::max(200, std::min(10000, period_ms));
 
         char buf[96];
         if (mode == "on" || mode == "off") {
@@ -274,7 +333,12 @@ private:
             snprintf(buf, sizeof(buf), "led %s %d %d %d %d", mode.c_str(), r, g, b, period_ms);
         }
         ESP_LOGI(TAG, "[UART TX] %s", buf);
-        serial_.SendLine(buf);
+        const char* response_prefix = mode == "rgb" ? "OK rgb" : "OK led";
+        std::string response;
+        if (!serial_.SendCommand(buf, response_prefix, response)) {
+            ESP_LOGW(TAG, "[LIGHT] command failed or timed out: %s", buf);
+            return false;
+        }
 
         if (mode == "off") {
             std::lock_guard<std::mutex> lock(motor_mutex_);
@@ -285,12 +349,23 @@ private:
             rgb_[1] = static_cast<uint8_t>(g);
             rgb_[2] = static_cast<uint8_t>(b);
         }
+        return true;
     }
 
-    void SetLedEmotion(const std::string& emotion) {
-        EnsureMotorBoardReady();
+    bool SetLedEmotion(const std::string& emotion, bool wait_for_response = false) {
         ESP_LOGI(TAG, "[UART TX] led emotion %s", emotion.c_str());
-        serial_.SendLine("led emotion " + emotion);
+        std::string command = "led emotion " + emotion;
+        if (!wait_for_response) {
+            serial_.SendLine(command);
+            return true;
+        }
+        EnsureMotorBoardReady();
+        std::string response;
+        if (!serial_.SendCommand(command, "OK led emotion", response)) {
+            ESP_LOGW(TAG, "[LIGHT] emotion command failed or timed out: %s", emotion.c_str());
+            return false;
+        }
+        return true;
     }
 
     // 解析下位机回报行: battery level=.. charging=.. discharging=..
@@ -561,9 +636,60 @@ private:
     void InitializeTools() {
         auto& mcp_server = McpServer::GetInstance();
 
+        auto add_chassis_action = [this, &mcp_server](const char* name, const char* description,
+                                                      const char* action) {
+            mcp_server.AddTool(
+                name, description,
+                PropertyList({Property("speed", kPropertyTypeInteger, MOTOR_SPEED_DEFAULT,
+                                       MOTOR_SPEED_MIN, MOTOR_SPEED_MAX)}),
+                [this, action](const PropertyList& properties) -> ReturnValue {
+                    return DriveAction(action, properties["speed"].value<int>());
+                });
+        };
+        add_chassis_action("self.chassis.go_forward", "控制小车向前行走。", "forward");
+        add_chassis_action("self.chassis.go_back", "控制小车向后行走。", "back");
+        add_chassis_action("self.chassis.turn_left", "控制小车原地左转。", "turn_left");
+        add_chassis_action("self.chassis.turn_right", "控制小车原地右转。", "turn_right");
+        mcp_server.AddTool(
+            "self.chassis.stop", "立即停止小车。", PropertyList(),
+            [this](const PropertyList&) -> ReturnValue { return DriveAction("stop", 0); });
+
+        mcp_server.AddTool("self.led.set_color", "设置小车 RGB 灯颜色。",
+                           PropertyList({Property("red", kPropertyTypeInteger, 0, 0, 255),
+                                         Property("green", kPropertyTypeInteger, 0, 0, 255),
+                                         Property("blue", kPropertyTypeInteger, 0, 0, 255)}),
+                           [this](const PropertyList& properties) -> ReturnValue {
+                               return SetLedMode("rgb", properties["red"].value<int>(),
+                                                 properties["green"].value<int>(),
+                                                 properties["blue"].value<int>());
+                           });
+        mcp_server.AddTool(
+            "self.led.off", "关闭小车 RGB 灯。", PropertyList(),
+            [this](const PropertyList&) -> ReturnValue { return SetLedMode("off"); });
+        mcp_server.AddTool("self.led.set_emotion",
+                           "设置小车灯光情绪。可选 "
+                           "happy、listening、thinking、charging、working、warning、error、off。",
+                           PropertyList({Property("emotion", kPropertyTypeString, "off")}),
+                           [this](const PropertyList& properties) -> ReturnValue {
+                               return SetLedEmotion(
+                                   ToLower(properties["emotion"].value<std::string>()), true);
+                           });
+
+        auto get_chassis_status = [this](const PropertyList&) -> ReturnValue {
+            ESP_LOGI(TAG, "[MCP] chassis.get_status");
+            EnsureMotorBoardReady();
+            std::string response;
+            if (!serial_.SendCommand("status", "{", response)) {
+                return std::string("Motor board status request timed out");
+            }
+            return response;
+        };
+        mcp_server.AddTool("self.chassis.get_status", "获取小车电机、电池、灯光和 BLE 状态。",
+                           PropertyList(), get_chassis_status);
+
         mcp_server.AddTool(
             "self.rover.action",
-            "控制小车动作。action 可选 forward、back、turn_left、turn_right、stop；speed 为 0-40 "
+            "控制小车动作。action 可选 forward、back、turn_left、turn_right、stop；speed 为 0-80 "
             "的安全百分比。",
             PropertyList({Property("action", kPropertyTypeString, "stop"),
                           Property("speed", kPropertyTypeInteger, MOTOR_SPEED_DEFAULT,
@@ -573,20 +699,11 @@ private:
                 int speed = properties["speed"].value<int>();
                 ESP_LOGI(TAG, "[MCP] rover.action action=%s speed=%d", action.c_str(), speed);
 
-                if (action == "forward") {
-                    DriveMotors(speed, speed);
-                } else if (action == "back") {
-                    DriveMotors(-speed, -speed);
-                } else if (action == "turn_left") {
-                    DriveMotors(-speed, speed);
-                } else if (action == "turn_right") {
-                    DriveMotors(speed, -speed);
-                } else if (action == "stop") {
-                    DriveMotors(0, 0);
-                } else {
+                if (action != "forward" && action != "back" && action != "turn_left" &&
+                    action != "turn_right" && action != "stop") {
                     return std::string("Unsupported action: ") + action;
                 }
-                return true;
+                return DriveAction(action, speed);
             });
 
         mcp_server.AddTool(
@@ -598,7 +715,7 @@ private:
                           Property("red", kPropertyTypeInteger, 0, 0, 255),
                           Property("green", kPropertyTypeInteger, 0, 0, 255),
                           Property("blue", kPropertyTypeInteger, 0, 0, 255),
-                          Property("period_ms", kPropertyTypeInteger, 1000, 100, 10000)}),
+                          Property("period_ms", kPropertyTypeInteger, 1000, 200, 10000)}),
             [this](const PropertyList& properties) -> ReturnValue {
                 std::string mode = ToLower(properties["mode"].value<std::string>());
                 std::string emotion = ToLower(properties["emotion"].value<std::string>());
@@ -610,35 +727,18 @@ private:
                          mode.c_str(), emotion.c_str(), r, g, b, period);
 
                 if (mode == "emotion") {
-                    SetLedEmotion(emotion);
+                    return SetLedEmotion(emotion, true);
                 } else if (mode == "off" || mode == "on" || mode == "rgb" || mode == "breathe" ||
                            mode == "blink") {
-                    SetLedMode(mode, r, g, b, period);
+                    return SetLedMode(mode, r, g, b, period);
                 } else {
                     return std::string("Unsupported light mode: ") + mode;
                 }
-                return true;
             });
 
         mcp_server.AddTool("self.rover.get_status",
                            "获取小车实时状态，包括电机、电池、灯光、速度限制和 BLE 状态。",
-                           PropertyList(), [this](const PropertyList& properties) -> ReturnValue {
-                               ESP_LOGI(TAG, "[MCP] rover.get_status");
-                               EnsureMotorBoardReady();
-                               serial_.SendLine("status");
-                               QueryBattery();
-                               std::lock_guard<std::mutex> lock(motor_mutex_);
-                               char buf[192];
-                               snprintf(
-                                   buf, sizeof(buf),
-                                   "{\"motor\":{\"m0\":%d,\"m1\":%d},\"rgb\":[%d,%d,%d],"
-                                   "\"battery\":{\"level\":%d,\"charging\":%d,\"discharging\":%d},"
-                                   "\"speed_limit\":%d}",
-                                   motor_speed_[0], motor_speed_[1], rgb_[0], rgb_[1], rgb_[2],
-                                   battery_level_, battery_charging_ ? 1 : 0,
-                                   battery_discharging_ ? 1 : 0, MOTOR_SPEED_MAX);
-                               return std::string(buf);
-                           });
+                           PropertyList(), get_chassis_status);
     }
 
 public:
