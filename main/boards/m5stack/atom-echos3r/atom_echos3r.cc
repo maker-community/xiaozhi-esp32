@@ -689,7 +689,7 @@ private:
 
         mcp_server.AddTool(
             "self.rover.action",
-            "控制小车动作。action 可选 forward、back、turn_left、turn_right、stop；speed 为 0-80 "
+            "控制小车动作。action 可选 forward、back、turn_left、turn_right、stop；speed 为 80-100 "
             "的安全百分比。",
             PropertyList({Property("action", kPropertyTypeString, "stop"),
                           Property("speed", kPropertyTypeInteger, MOTOR_SPEED_DEFAULT,
