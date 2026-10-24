@@ -74,10 +74,78 @@ slots for the board's audio codec/amplifier.
 - **XIAO BOOT (GPIO0):** click to start/stop a conversation; during startup,
   click to enter Wi-Fi configuration.
 - **XIAO RST:** resets the ESP32-S3.
+- **XIAO D3 (GPIO4):** connect a button to GND to control conversation state;
+  during startup, it enters Wi-Fi configuration, matching the onboard BOOT
+  button's application behavior. It is not a hardware reset or ROM BOOT button.
+- **XIAO D0 (GPIO1):** supports an optional 12-pixel WS2812 assistant ring,
+  with effects described below. Use a suitably rated 5 V supply with common ground;
+  do not power the strip from a GPIO. A 5 V-compatible level shifter between
+  GPIO1 and the strip's DIN is recommended.
+- **XIAO D2 (GPIO3):** unused. GPIO3 is a strapping-related pin; verify that an
+  attached button circuit will not alter its level during reset.
+- **Optional BQ27220 fuel gauge:** connect it to the core board's `I2C_SDA`
+  (D4/GPIO5), `I2C_SCL` (D5/GPIO6), and common ground. Firmware reuses the
+  XVF3800 I2C bus and only probes address `0x55` and reads the device number,
+  voltage, current, SOC and design capacity. The battery's 4440 mWh / 3.7 V
+  rating corresponds to about 1200 mAh. A matching device number and valid
+  telemetry enable reporting; a design-capacity mismatch only warns, without
+  disabling monitoring. Absence or failed reads omit battery data without blocking boot.
+  `self.get_device_status` includes reference SOC, charging, voltage (mV), current
+  (mA, positive for charging), gauge/expected capacities and a capacity-match flag.
+  `soc_accuracy` is always `unverified`; `soc_note` warns that SOC is not calibrated.
+  Matching capacity does not verify the cell curve. Do not use this reference
+  percentage for accurate runtime prediction or automatic shutdown.
+- Startup marker `BQ27220 monitor v3` reports SDA/SCL, address and the probe
+  timeout in milliseconds. `did not ACK` means the address did not respond;
+  `probe failed ... ESP_ERR_TIMEOUT` is a timeout, not proof that the module is
+  absent. Check power, common ground, wiring and 3.3 V pull-ups.
+  Identification logs include the device number, voltage, SOC and actual design
+  capacity; a capacity mismatch has its own warning. The device-number query sends
+  `Control(0x0001)` and expects `0x0220`, without changing the cell configuration.
+  Detection happens only at startup: connect with power off and reboot.
+  Hot-plugging and automatic discovery after boot are not supported.
+- SOC accuracy depends on the cell chemistry, capacity and CEDV profile already
+  configured in the gauge. This driver **does not write or change gauge
+  configuration**; ensure the module is configured for the actual cell.
+  I2C logic must be 3.3 V compatible; do not let an external module pull SDA/SCL
+  up to 5 V. BQ27220 is not a charger or protection circuit; wire cell sensing,
+  protection and power according to the gauge module and battery specifications.
 - **Flex core-board RST and SafeMode/Boot:** act on the XMOS, not the XIAO
   conversation button. They are not connected by this driver as user keys.
-- **Status LED:** uses the active-low XIAO GPIO21 LED with inverted output,
-  not the XMOS array's LEDs.
+- **Status LEDs:** use the active-low XIAO GPIO21 LED and optional D0 WS2812
+  strip. The onboard LED retains its original effects; the external ring uses
+  smooth animation. Neither controls the XMOS array's LEDs.
+
+### External assistant ring
+
+| State | Effect |
+| --- | --- |
+| Idle | Very dim blue breathing over 5 seconds, instead of turning completely off |
+| Starting / connecting | Slowly orbiting blue/cyan glow |
+| Listening / audio testing | Blue/cyan breathing with symmetric highlights responding to capture energy, not direction |
+| Speaking | Blue/cyan/violet waves, brightness following audio accepted by I2S |
+| Notification playback | Warm amber breathing, also responsive to playback energy |
+| Wi-Fi setup | Amber breathing over 3 seconds |
+| Activation | Slow violet breathing |
+| Upgrade | Orbiting mint glow, not a percentage-progress indicator |
+| Fatal error | Slow red breathing, without rapid flashing |
+
+A dedicated low-priority task renders at approximately 40 fps. State changes
+ease from the current colors over 450 ms; repeated state notifications do not
+restart the animation. Gamma is 2.2, with each PWM channel capped at 80/255.
+This is not current sensing or hardware current limiting; size the power supply
+according to the strip specification.
+Energy is measured only from this board's captured PCM or samples accepted by
+I2S, including the playback volume setting, and decays when audio stops.
+It is not sample-accurate synchronization, direction finding or emotion detection.
+Generic notification state cannot distinguish individual warning reasons.
+No new sounds are added and existing audio content is unchanged.
+The external ring, button and audio response still require physical validation.
+
+Design references: [Home Assistant Voice](https://www.home-assistant.io/voice-pe/)
+and [Adafruit gamma correction](https://learn.adafruit.com/led-tricks-gamma-correction/the-quick-fix).
+The palette, timing and brightness cap are board-specific design choices,
+not an exact reproduction of those products.
 
 USB Serial/JTAG is selected because GPIO43/44 are occupied by audio.
 The board uses the default `NoDisplay` implementation.
